@@ -1,0 +1,14 @@
+{
+  "type": "code",
+  "modid": "handbookopt",
+  "name": "Handbook & Craft Opt",
+  "authors": [
+    "Nilsson"
+  ],
+  "description": "Enhances crafting and handbook usability with a searchable, paginated recipe browser, one-click crafting grid filling, bulk ingredient transfer, compact ingredient tooltips with grouped quantities and rotating variant previews, and a searchable mod guide browser. Preserves the vanilla Handbook and supports recipes from both vanilla and mods.",
+  "version": "1.5.1",
+  "side": "Universal",
+  "dependencies": {
+    "game": "1.22.7"
+  }
+}

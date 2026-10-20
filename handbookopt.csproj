@@ -1,0 +1,68 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputPath>bin/</OutputPath>
+
+    <!--
+      Ruta de instalación del juego. Prioridad:
+      1) Propiedad pasada a MSBuild: -p:VintageStoryPath="C:\\...\\Vintagestory"
+      2) Variable de entorno VINTAGE_STORY
+      3) Rutas de instalación habituales en Windows.
+    -->
+    <VintageStoryPath Condition="'$(VintageStoryPath)' == '' and '$(VintagestoryDir)' != ''">$(VintagestoryDir)</VintageStoryPath>
+    <VintageStoryPath Condition="'$(VintageStoryPath)' == '' and '$(VINTAGE_STORY)' != ''">$(VINTAGE_STORY)</VintageStoryPath>
+    <VintageStoryPath Condition="'$(VintageStoryPath)' == '' and Exists('$(APPDATA)\Vintagestory\VintagestoryAPI.dll')">$(APPDATA)\Vintagestory</VintageStoryPath>
+    <VintageStoryPath Condition="'$(VintageStoryPath)' == '' and Exists('$(ProgramFiles)\Vintage Story\VintagestoryAPI.dll')">$(ProgramFiles)\Vintage Story</VintageStoryPath>
+    <VintageStoryPath Condition="'$(VintageStoryPath)' == '' and Exists('$(ProgramFiles(x86))\Steam\steamapps\common\Vintage Story\VintagestoryAPI.dll')">$(ProgramFiles(x86))\Steam\steamapps\common\Vintage Story</VintageStoryPath>
+    <VintageStoryPath Condition="'$(VintageStoryPath)' == '' and Exists('$(ProgramFiles)\Steam\steamapps\common\Vintage Story\VintagestoryAPI.dll')">$(ProgramFiles)\Steam\steamapps\common\Vintage Story</VintageStoryPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="VintagestoryAPI">
+      <HintPath>$(VintageStoryPath)\VintagestoryAPI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="VintagestoryLib">
+      <HintPath>$(VintageStoryPath)\VintagestoryLib.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="VSSurvivalMod">
+      <HintPath>$(VintageStoryPath)\Mods\VSSurvivalMod.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(VintageStoryPath)\Lib\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="cairo-sharp">
+      <HintPath>$(VintageStoryPath)\Lib\cairo-sharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <Target Name="ValidateVintageStoryReferences" BeforeTargets="ResolveReferences">
+    <Error
+      Condition="'$(VintageStoryPath)' == ''"
+      Text="No se detectó la carpeta de Vintage Story. Abre la carpeta del juego (debe contener VintagestoryAPI.dll) y compila con: dotnet build -c Release -p:VintageStoryPath=&quot;RUTA_COMPLETA_DEL_JUEGO&quot;. También puedes definir la variable VINTAGE_STORY." />
+    <Error
+      Condition="!Exists('$(VintageStoryPath)\VintagestoryAPI.dll')"
+      Text="VintageStoryPath apunta a una carpeta incorrecta: '$(VintageStoryPath)'. No se encuentra VintagestoryAPI.dll. Debes indicar la carpeta de instalación del juego, no VintagestoryData ni la carpeta Mods." />
+    <Error
+      Condition="!Exists('$(VintageStoryPath)\VintagestoryLib.dll')"
+      Text="Falta VintagestoryLib.dll en '$(VintageStoryPath)'. Comprueba la carpeta de instalación de Vintage Story." />
+    <Error
+      Condition="!Exists('$(VintageStoryPath)\Mods\VSSurvivalMod.dll')"
+      Text="Falta Mods\VSSurvivalMod.dll en '$(VintageStoryPath)'. Comprueba que Vintage Story esté instalado completamente y que VintageStoryPath apunte a la carpeta correcta." />
+    <Error
+      Condition="!Exists('$(VintageStoryPath)\Lib\0Harmony.dll')"
+      Text="Falta Lib\0Harmony.dll en '$(VintageStoryPath)'. Comprueba que VintageStoryPath apunte a la carpeta de instalación del juego." />
+    <Error
+      Condition="!Exists('$(VintageStoryPath)\Lib\cairo-sharp.dll')"
+      Text="Falta Lib\cairo-sharp.dll en '$(VintageStoryPath)'. El tooltip de recetas utiliza Cairo para dibujar su textura; comprueba que la ruta apunte a la instalación completa del juego." />
+    <Message Importance="high" Text="HandbookOpt: usando referencias de Vintage Story desde '$(VintageStoryPath)'" />
+  </Target>
+</Project>

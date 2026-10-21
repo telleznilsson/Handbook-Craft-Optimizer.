@@ -7,6 +7,7 @@ using Cairo;
 using Vintagestory.API.Client;
 using Vintagestory.API.Common;
 using Vintagestory.API.Config;
+using Vintagestory.API.Datastructures;
 using Vintagestory.API.MathTools;
 using Vintagestory.GameContent;
 
@@ -333,6 +334,23 @@ namespace HandbookOpt
             public ItemStack Representative;
             public int Available;
             public int MaxStackSize;
+        }
+
+        // A single visible recipe tile can represent several recipes only when their
+        // ingredient rules and layout are demonstrably identical but their outputs differ.
+        // The active recipe index is also the recipe OnPick() will load, so the badge and
+        // the selected craft can never drift apart.
+        sealed class RecipeVariantDisplayGroup
+        {
+            public string InputKey;
+            public readonly List<int> RecipeIndexes = new List<int>(2);
+            public readonly Dictionary<int, int> TimesByRecipe = new Dictionary<int, int>();
+            public int ActiveVariantIndex;
+            public long NextSlideAt;
+            public long RemainingWhenPaused;
+            public bool IsPaused;
+            public DummySlot DisplaySlot;
+            public SkillItem VisibleSkill;
         }
 
         // GuiElementSkillItemGrid's Action<int> does not include mouse modifiers.
@@ -1140,6 +1158,13 @@ namespace HandbookOpt
         List<bool> shownCraftable = new List<bool>();
         List<int> matches = new List<int>();
         List<int> times = new List<int>();
+        // Parallel to matches/times: one catalog tile can cycle between output-distinct
+        // recipes with exactly the same input requirements.
+        List<RecipeVariantDisplayGroup> matchVariantGroups = new List<RecipeVariantDisplayGroup>();
+        List<CompactRecipe> variantKeyCacheCatalog;
+        readonly Dictionary<int, string> variantInputKeyCache = new Dictionary<int, string>();
+        LoadedTexture recipeVariantsBadgeTexture;
+        bool recipeVariantsBadgeLoadAttempted;
         int page;
         string search = "";
         // El clic normal añade una tanda. Shift+clic calcula el máximo.
@@ -1178,7 +1203,14 @@ namespace HandbookOpt
         long watchListener;
 
         public override string ToggleKeyCombinationCode => null;
-        public override double DrawOrder => 0.21;
+        // No forzar el selector al frente de todas las ventanas de forma permanente.
+        // El diálogo enfocado queda por encima del inventario vanilla (0.2); cuando pierde
+        // el foco vuelve a una capa inferior para permitir que otra ventana quede delante.
+        // El navegador de guías conserva prioridad visual con DrawOrder 0.23.
+        public override double DrawOrder => Focused && !IsGuideBrowserInFront() ? 0.22 : 0.18;
+        // La ventana enfocada procesa primero el input. Una ventana desenfocada lo procesa
+        // después del inventario vanilla para no robar clics/teclas cuando está detrás.
+        public override double InputOrder => Focused && !IsGuideBrowserInFront() ? 0.45 : 0.55;
         public override bool PrefersUngrabbedMouse => true;
         public override bool CaptureAllInputs() => false;
 
@@ -1376,6 +1408,10 @@ namespace HandbookOpt
             wasOpen = inv;
 
             if (!inv || userHid) return;
+
+            // La vista de recetas hace rotar la insignia/miniatura; la salida nativa de la
+            // cuadrícula permanece fija. El tiempo se congela únicamente sobre el mosaico.
+            UpdateRecipeVariantCarousel();
 
             // Mantener el panel sincronizado si el jugador mueve o consume materiales
             // mientras el inventario sigue abierto.
@@ -1922,8 +1958,13 @@ namespace HandbookOpt
 
         void RebuildMatches()
         {
+            // Keep the old group objects alive until we know whether their visible tiles
+            // need rebuilding. RenderHandler closures keep references to these objects.
+            var previousDisplayGroups = new List<RecipeVariantDisplayGroup>(matchVariantGroups);
+            Dictionary<string, int> previousVariantByInput = CaptureActiveVariants();
             matches.Clear();
             times.Clear();
+            matchVariantGroups = new List<RecipeVariantDisplayGroup>();
             if (!HandbookOptMod.IndexReady)
             {
                 ComposeAndOpen();
@@ -2005,6 +2046,16 @@ namespace HandbookOpt
                 }
             }
 
+            // Collapse only strict input-equivalent recipes with different outputs.
+            // Searches remain output-specific: if the user searches for one result, only
+            // matching outputs enter the group and no unrelated result is silently shown.
+            GroupMatchesIntoOutputVariants(previousVariantByInput);
+            // Reuse a matching existing static tile as the visual owner of an ALT group,
+            // preferring a vanilla recipe entry when its output is represented. The old
+            // detached ALT row is removed only after the group has a host, avoiding a
+            // second tile that then needs to be hidden afterward.
+            PromoteVariantGroupsIntoExistingTiles();
+
             int pages = Math.Max(1, (matches.Count + PageSize - 1) / PageSize);
             if (page >= pages) page = pages - 1;
             if (page < 0) page = 0;
@@ -2016,11 +2067,569 @@ namespace HandbookOpt
             // los 24 iconos visibles cuando el contenido del inventario cambia.
             if (IsBrowsingRecipeCatalog()) signatureBuilder.Append(lastInventorySignature ?? string.Empty).Append('|');
             for (int i = 0; i < matches.Count; i++)
-                signatureBuilder.Append(matches[i]).Append(':').Append(times[i]).Append(';');
+            {
+                signatureBuilder.Append(matches[i]).Append(':').Append(times[i]).Append('[');
+                RecipeVariantDisplayGroup group = i < matchVariantGroups.Count ? matchVariantGroups[i] : null;
+                if (group != null)
+                {
+                    for (int v = 0; v < group.RecipeIndexes.Count; v++)
+                        signatureBuilder.Append(group.RecipeIndexes[v]).Append(',');
+                }
+                signatureBuilder.Append("]; ");
+            }
             string sig = signatureBuilder.ToString();
-            if (sig == lastSig && IsOpened()) return;
+            if (sig == lastSig && IsOpened())
+            {
+                // The visible recipe groups are identical. Restore their original state so
+                // the already-composed RenderHandlers keep pointing at the live carousel,
+                // including the pause countdown and reusable DummySlot.
+                matchVariantGroups = previousDisplayGroups;
+                return;
+            }
             lastSig = sig;
             ComposeAndOpen();
+        }
+
+        Dictionary<string, int> CaptureActiveVariants()
+        {
+            var result = new Dictionary<string, int>(StringComparer.Ordinal);
+            // Only the visible page can be rotating. Preserving these few selections is
+            // enough and avoids allocating a dictionary for thousands of off-screen recipes.
+            int start = Math.Max(0, page * PageSize);
+            int end = Math.Min(Math.Min(matchVariantGroups.Count, matches.Count), start + PageSize);
+            for (int i = start; i < end; i++)
+            {
+                RecipeVariantDisplayGroup group = matchVariantGroups[i];
+                if (group == null || string.IsNullOrEmpty(group.InputKey) || matches[i] < 0) continue;
+                result[group.InputKey] = matches[i];
+            }
+            return result;
+        }
+
+        void GroupMatchesIntoOutputVariants(Dictionary<string, int> previousVariantByInput)
+        {
+            if (matches.Count < 2)
+            {
+                matchVariantGroups.Clear();
+                if (matches.Count == 1)
+                {
+                    var one = new RecipeVariantDisplayGroup { InputKey = GetRecipeInputKeyCached(matches[0]) };
+                    one.RecipeIndexes.Add(matches[0]);
+                    one.TimesByRecipe[matches[0]] = times[0];
+                    matchVariantGroups.Add(one);
+                }
+                return;
+            }
+
+            var rawMatches = new List<int>(matches);
+            var rawTimes = new List<int>(times);
+            matches.Clear();
+            times.Clear();
+            matchVariantGroups.Clear();
+
+            var groupByInput = new Dictionary<string, RecipeVariantDisplayGroup>(StringComparer.Ordinal);
+            for (int i = 0; i < rawMatches.Count; i++)
+            {
+                int recipeIndex = rawMatches[i];
+                CompactRecipe recipe = CraftCatalog.Recipes[recipeIndex];
+                string inputKey = GetRecipeInputKeyCached(recipeIndex);
+
+                // Unknown/custom matcher rules get a private key; never merge them merely
+                // because their display text or resolved ingredient IDs happen to match.
+                bool canGroup = !string.IsNullOrEmpty(inputKey);
+                string dictionaryKey = canGroup ? inputKey : "\u0001single:" + recipeIndex.ToString(CultureInfo.InvariantCulture);
+
+                if (canGroup && groupByInput.TryGetValue(dictionaryKey, out RecipeVariantDisplayGroup existing))
+                {
+                    bool duplicateOutput = false;
+                    for (int v = 0; v < existing.RecipeIndexes.Count; v++)
+                    {
+                        CompactRecipe present = CraftCatalog.Recipes[existing.RecipeIndexes[v]];
+                        if (RecipesDemonstrablyEquivalent(present, recipe))
+                        {
+                            duplicateOutput = true;
+                            break;
+                        }
+                    }
+                    if (!duplicateOutput)
+                    {
+                        existing.RecipeIndexes.Add(recipeIndex);
+                        existing.TimesByRecipe[recipeIndex] = rawTimes[i];
+                    }
+                    continue;
+                }
+
+                var group = new RecipeVariantDisplayGroup { InputKey = canGroup ? inputKey : string.Empty };
+                group.RecipeIndexes.Add(recipeIndex);
+                group.TimesByRecipe[recipeIndex] = rawTimes[i];
+                matchVariantGroups.Add(group);
+                if (canGroup) groupByInput[dictionaryKey] = group;
+            }
+
+            for (int i = 0; i < matchVariantGroups.Count; i++)
+            {
+                RecipeVariantDisplayGroup group = matchVariantGroups[i];
+                int activeRecipe = group.RecipeIndexes[0];
+                if (!string.IsNullOrEmpty(group.InputKey)
+                    && previousVariantByInput != null
+                    && previousVariantByInput.TryGetValue(group.InputKey, out int previousRecipe)
+                    && group.RecipeIndexes.Contains(previousRecipe))
+                {
+                    activeRecipe = previousRecipe;
+                }
+                group.ActiveVariantIndex = Math.Max(0, group.RecipeIndexes.IndexOf(activeRecipe));
+                matches.Add(activeRecipe);
+                times.Add(group.TimesByRecipe.TryGetValue(activeRecipe, out int n) ? n : 0);
+            }
+        }
+
+
+        void PromoteVariantGroupsIntoExistingTiles()
+        {
+            // Compact Available view: keep one visual row for outputs represented by ALT.
+            // First move each ALT carousel onto an existing single-recipe row with a
+            // demonstrably equivalent output. Prefer the vanilla "game" row when possible.
+            // The full recipe catalog returns above and is not rewritten by this UI rule.
+            if (IsBrowsingRecipeCatalog() || matches.Count < 2 ||
+                matchVariantGroups.Count != matches.Count || times.Count != matches.Count) return;
+
+            var originalMatches = new List<int>(matches);
+            var originalTimes = new List<int>(times);
+            var originalGroups = new List<RecipeVariantDisplayGroup>(matchVariantGroups);
+
+            // Each static row can host at most one ALT group. An ALT source row is removed
+            // only if its group was successfully transferred to a host row.
+            var hostToGroupSource = new Dictionary<int, int>();
+            var consumedAltTiles = new HashSet<int>();
+            var usedHosts = new HashSet<int>();
+
+            for (int sourceIndex = 0; sourceIndex < originalGroups.Count; sourceIndex++)
+            {
+                RecipeVariantDisplayGroup altGroup = originalGroups[sourceIndex];
+                if (altGroup == null || altGroup.RecipeIndexes.Count < 2) continue;
+
+                int bestHost = -1;
+                for (int candidateIndex = 0; candidateIndex < originalGroups.Count; candidateIndex++)
+                {
+                    if (candidateIndex == sourceIndex || usedHosts.Contains(candidateIndex) ||
+                        consumedAltTiles.Contains(candidateIndex)) continue;
+
+                    RecipeVariantDisplayGroup candidateGroup = originalGroups[candidateIndex];
+                    if (candidateGroup == null || candidateGroup.RecipeIndexes.Count != 1) continue;
+
+                    int candidateRecipeIndex = originalMatches[candidateIndex];
+                    if (candidateRecipeIndex < 0 || candidateRecipeIndex >= CraftCatalog.Recipes.Count) continue;
+
+                    ItemStack candidateOutput = CraftCatalog.Recipes[candidateRecipeIndex].Output;
+                    if (candidateOutput?.Collectible == null) continue;
+
+                    bool outputRepresented = false;
+                    for (int variant = 0; variant < altGroup.RecipeIndexes.Count; variant++)
+                    {
+                        int variantRecipeIndex = altGroup.RecipeIndexes[variant];
+                        if (variantRecipeIndex < 0 || variantRecipeIndex >= CraftCatalog.Recipes.Count) continue;
+                        ItemStack variantOutput = CraftCatalog.Recipes[variantRecipeIndex].Output;
+                        if (OutputsDemonstrablyEquivalent(candidateOutput, variantOutput))
+                        {
+                            outputRepresented = true;
+                            break;
+                        }
+                    }
+                    if (!outputRepresented) continue;
+
+                    CompactRecipe candidateRecipe = CraftCatalog.Recipes[candidateRecipeIndex];
+                    // Only promote into a vanilla row. Moving an ALT group onto an arbitrary
+                    // mod recipe would unexpectedly relocate it and could obscure the mod's
+                    // original list organization. If no vanilla host exists, keep the ALT row
+                    // where it was; the conservative compaction below removes only a row whose
+                    // input signature and output are both represented by an ALT group.
+                    if (!string.Equals(candidateRecipe.SourceDomain, "game", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    if (bestHost < 0 || candidateIndex < bestHost)
+                    {
+                        bestHost = candidateIndex;
+                    }
+                }
+
+                if (bestHost < 0) continue;
+                hostToGroupSource[bestHost] = sourceIndex;
+                usedHosts.Add(bestHost);
+                consumedAltTiles.Add(sourceIndex);
+            }
+
+            // Rebuild rows in their existing order. The selected host gets the live ALT
+            // group and active recipe index; the former detached ALT row is discarded.
+            var movedMatches = new List<int>(originalMatches.Count);
+            var movedTimes = new List<int>(originalTimes.Count);
+            var movedGroups = new List<RecipeVariantDisplayGroup>(originalGroups.Count);
+            for (int i = 0; i < originalMatches.Count; i++)
+            {
+                if (consumedAltTiles.Contains(i)) continue;
+
+                if (hostToGroupSource.TryGetValue(i, out int sourceIndex))
+                {
+                    RecipeVariantDisplayGroup group = originalGroups[sourceIndex];
+                    int activeRecipeIndex = originalMatches[sourceIndex];
+                    movedMatches.Add(activeRecipeIndex);
+                    movedTimes.Add(group.TimesByRecipe.TryGetValue(activeRecipeIndex, out int count) ? count : 0);
+                    movedGroups.Add(group);
+                }
+                else
+                {
+                    movedMatches.Add(originalMatches[i]);
+                    movedTimes.Add(originalTimes[i]);
+                    movedGroups.Add(originalGroups[i]);
+                }
+            }
+
+            // Keep references to the exact ALT groups. A singleton may be suppressed only
+            // when BOTH its input signature and output are represented by one of these groups.
+            // Output-only suppression is unsafe: custom ingredients can be uncomparable and
+            // still define a separate crafting route to the same item (e.g. matrix test mods).
+            var representedAltGroups = new List<RecipeVariantDisplayGroup>(8);
+            for (int i = 0; i < movedGroups.Count; i++)
+            {
+                RecipeVariantDisplayGroup group = movedGroups[i];
+                if (group == null || group.RecipeIndexes.Count < 2 || string.IsNullOrEmpty(group.InputKey)) continue;
+                representedAltGroups.Add(group);
+            }
+
+            if (representedAltGroups.Count == 0) return;
+
+            var keptMatches = new List<int>(movedMatches.Count);
+            var keptTimes = new List<int>(movedTimes.Count);
+            var keptGroups = new List<RecipeVariantDisplayGroup>(movedGroups.Count);
+            for (int i = 0; i < movedMatches.Count; i++)
+            {
+                RecipeVariantDisplayGroup group = movedGroups[i];
+                bool isAltOwner = group != null && group.RecipeIndexes.Count > 1;
+                if (!isAltOwner)
+                {
+                    int recipeIndex = movedMatches[i];
+                    if (recipeIndex >= 0 && recipeIndex < CraftCatalog.Recipes.Count)
+                    {
+                        string candidateInputKey = GetRecipeInputKeyCached(recipeIndex);
+                        // Empty means the matcher could not be represented safely by our key.
+                        // Never discard that recipe merely because its output appears on an ALT tile.
+                        if (!string.IsNullOrEmpty(candidateInputKey))
+                        {
+                            ItemStack output = CraftCatalog.Recipes[recipeIndex].Output;
+                            if (output?.Collectible != null)
+                            {
+                                bool alreadyRepresented = false;
+                                for (int g = 0; g < representedAltGroups.Count && !alreadyRepresented; g++)
+                                {
+                                    RecipeVariantDisplayGroup altGroup = representedAltGroups[g];
+                                    if (!string.Equals(candidateInputKey, altGroup.InputKey, StringComparison.Ordinal)) continue;
+
+                                    for (int v = 0; v < altGroup.RecipeIndexes.Count; v++)
+                                    {
+                                        int variantRecipeIndex = altGroup.RecipeIndexes[v];
+                                        if (variantRecipeIndex < 0 || variantRecipeIndex >= CraftCatalog.Recipes.Count) continue;
+                                        ItemStack variantOutput = CraftCatalog.Recipes[variantRecipeIndex].Output;
+                                        if (OutputsDemonstrablyEquivalent(output, variantOutput))
+                                        {
+                                            alreadyRepresented = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (alreadyRepresented) continue;
+                            }
+                        }
+                    }
+                }
+
+                keptMatches.Add(movedMatches[i]);
+                keptTimes.Add(movedTimes[i]);
+                keptGroups.Add(group);
+            }
+
+            matches.Clear();
+            matches.AddRange(keptMatches);
+            times.Clear();
+            times.AddRange(keptTimes);
+            matchVariantGroups = keptGroups;
+        }
+
+        string GetRecipeInputKeyCached(int recipeIndex)
+        {
+            if (!ReferenceEquals(variantKeyCacheCatalog, CraftCatalog.Recipes))
+            {
+                variantInputKeyCache.Clear();
+                variantKeyCacheCatalog = CraftCatalog.Recipes;
+            }
+            if (variantInputKeyCache.TryGetValue(recipeIndex, out string cached))
+                return string.IsNullOrEmpty(cached) ? null : cached;
+
+            string key = recipeIndex >= 0 && recipeIndex < CraftCatalog.Recipes.Count
+                ? BuildRecipeInputKey(CraftCatalog.Recipes[recipeIndex])
+                : null;
+            // Empty string caches a deliberately ungroupable recipe too.
+            variantInputKeyCache[recipeIndex] = key ?? string.Empty;
+            return key;
+        }
+
+        string BuildRecipeInputKey(CompactRecipe recipe)
+        {
+            if (recipe?.Recipe == null || recipe.Ings == null || recipe.Slots == null
+                || recipe.Ings.Length == 0 || recipe.Ings.Length != recipe.Slots.Length)
+                return null;
+
+            GridRecipe gridRecipe = recipe.Recipe;
+            var sb = new StringBuilder(256);
+            AppendVariantKeyField(sb, gridRecipe.Shapeless ? "shapeless" : "shaped");
+            // La identidad se basa en las celdas físicas efectivas (recipe.Slots), no
+            // en Width/Height declarados: una receta 2x1 y otra 3x1 pueden ocupar las
+            // mismas celdas en la cuadrícula 3x3 y no deben dejar una variante estática.
+            AppendVariantKeyField(sb, recipe.RequiresTrait ?? string.Empty);
+
+            var ingredientKeys = new List<string>(recipe.Ings.Length);
+            for (int i = 0; i < recipe.Ings.Length; i++)
+            {
+                CraftingRecipeIngredient ingredient = recipe.Ings[i];
+                if (ingredient == null || ingredient.GetType() != typeof(CraftingRecipeIngredient)) return null;
+
+                try
+                {
+                    // Las condiciones de tags usan un comparador complejo del juego. Si no
+                    // podemos expresar su semántica exactamente, dejamos esa receta aparte.
+                    if (!ingredient.Tags.IsEmpty) return null;
+                }
+                catch { return null; }
+
+                string code;
+                try
+                {
+                    // Para una coincidencia exacta, la identidad canónica es el collectible
+                    // resuelto. Los códigos originales o nombres de la clave de patrón pueden
+                    // diferir entre mods aunque el ingrediente real sea el mismo.
+                    code = ingredient.MatchingType == EnumRecipeMatchType.Exact
+                        ? ingredient.ResolvedItemStack?.Collectible?.Code?.ToString() ?? ingredient.Code?.ToString() ?? string.Empty
+                        : ingredient.Code?.ToString() ?? ingredient.ResolvedItemStack?.Collectible?.Code?.ToString() ?? string.Empty;
+                }
+                catch { return null; }
+                if (string.IsNullOrWhiteSpace(code)) return null;
+
+                string attributes;
+                try { attributes = CanonicalJsonObject(ingredient.Attributes); }
+                catch { return null; }
+
+                // Allowed/skip variants sólo alteran la coincidencia del comodín; para
+                // ingredientes exactos son metadatos irrelevantes y no deben separar una receta.
+                var allowedVariants = ingredient.MatchingType == EnumRecipeMatchType.Exact
+                    ? new List<string>()
+                    : new List<string>(ingredient.AllowedVariants ?? Array.Empty<string>());
+                var skippedVariants = ingredient.MatchingType == EnumRecipeMatchType.Exact
+                    ? new List<string>()
+                    : new List<string>(ingredient.SkipVariants ?? Array.Empty<string>());
+                allowedVariants.Sort(StringComparer.Ordinal);
+                skippedVariants.Sort(StringComparer.Ordinal);
+
+                var ik = new StringBuilder(160);
+                AppendVariantKeyField(ik, ((int)ingredient.Type).ToString(CultureInfo.InvariantCulture));
+                AppendVariantKeyField(ik, ((int)ingredient.MatchingType).ToString(CultureInfo.InvariantCulture));
+                AppendVariantKeyField(ik, code);
+                AppendVariantKeyField(ik, (ingredient.Quantity > 0 ? ingredient.Quantity : 1).ToString(CultureInfo.InvariantCulture));
+                // Name solo participa en la sustitución de comodines; para ingredientes
+                // exactos no cambia qué objeto acepta la receta.
+                AppendVariantKeyField(ik, ingredient.MatchingType == EnumRecipeMatchType.Exact ? string.Empty : ingredient.Name ?? string.Empty);
+                AppendVariantKeyField(ik, string.Join("\u001f", allowedVariants));
+                AppendVariantKeyField(ik, string.Join("\u001f", skippedVariants));
+                // Consume/IsTool/Break/durabilidad describen el efecto posterior al
+                // aceptar una entrada, no el conjunto de objetos que la satisface. Se
+                // agrupan también estas variantes; al hacer clic se usa la receta real,
+                // por lo que el servidor conserva su consumo/devolución específico.
+                AppendVariantKeyField(ik, attributes);
+
+                if (!gridRecipe.Shapeless)
+                    ingredientKeys.Add(recipe.Slots[i].ToString(CultureInfo.InvariantCulture) + "=" + ik.ToString());
+                else
+                    ingredientKeys.Add(ik.ToString());
+            }
+
+            // Shaped recipes preserve cell positions. Shapeless recipes compare a sorted
+            // multiset, so ingredient order alone doesn't prevent grouping equivalent inputs.
+            if (gridRecipe.Shapeless) ingredientKeys.Sort(StringComparer.Ordinal);
+            for (int i = 0; i < ingredientKeys.Count; i++) AppendVariantKeyField(sb, ingredientKeys[i]);
+            return sb.ToString();
+        }
+
+        static void AppendVariantKeyField(StringBuilder builder, string value)
+        {
+            value = value ?? string.Empty;
+            builder.Append(value.Length.ToString(CultureInfo.InvariantCulture))
+                .Append(':').Append(value).Append('|');
+        }
+
+        bool RecipesDemonstrablyEquivalent(CompactRecipe a, CompactRecipe b)
+        {
+            if (a == null || b == null || !OutputsDemonstrablyEquivalent(a.Output, b.Output)) return false;
+            GridRecipe leftRecipe = a.Recipe;
+            GridRecipe rightRecipe = b.Recipe;
+            if (leftRecipe == null || rightRecipe == null) return false;
+
+            try
+            {
+                // No ocultar recetas que producen el mismo icono pero tienen efectos
+                // posteriores distintos (copiado de atributos, durabilidad o devoluciones).
+                if (!string.Equals(leftRecipe.CopyAttributesFrom, rightRecipe.CopyAttributesFrom, StringComparison.Ordinal)) return false;
+                if (!string.Equals(leftRecipe.RequiresTrait, rightRecipe.RequiresTrait, StringComparison.Ordinal)) return false;
+                if (leftRecipe.AverageDurability != rightRecipe.AverageDurability) return false;
+                if (!string.Equals(string.Join("\u001f", leftRecipe.MergeAttributesFrom ?? Array.Empty<string>()),
+                                   string.Join("\u001f", rightRecipe.MergeAttributesFrom ?? Array.Empty<string>()), StringComparison.Ordinal)) return false;
+                if (!string.Equals(CanonicalJsonObject(leftRecipe.Attributes),
+                                   CanonicalJsonObject(rightRecipe.Attributes), StringComparison.Ordinal)) return false;
+                if (!string.Equals(CanonicalJsonObject(leftRecipe.Output?.Attributes),
+                                   CanonicalJsonObject(rightRecipe.Output?.Attributes), StringComparison.Ordinal)) return false;
+                if (a.Ings == null || b.Ings == null || a.Ings.Length != b.Ings.Length) return false;
+                for (int i = 0; i < a.Ings.Length; i++)
+                {
+                    CraftingRecipeIngredient li = a.Ings[i];
+                    CraftingRecipeIngredient ri = b.Ings[i];
+                    string leftReturn = ReturnedStackKey(li?.ReturnedStack);
+                    string rightReturn = ReturnedStackKey(ri?.ReturnedStack);
+                    if (!string.Equals(leftReturn, rightReturn, StringComparison.Ordinal)) return false;
+                    if (li == null || ri == null) return false;
+                    // Ahora estos campos no separan grupos (son efectos de crafteo,
+                    // no identidad del ingrediente aceptado), pero sí deben impedir
+                    // eliminar una segunda receta como duplicado cuando el resultado
+                    // visible es igual y cambia el consumo o la durabilidad.
+                    if (li.Consume != ri.Consume || li.IsTool != ri.IsTool || li.Break != ri.Break ||
+                        li.DurabilityChange != ri.DurabilityChange || li.ToolDurabilityCost != ri.ToolDurabilityCost)
+                        return false;
+                    if (!string.Equals(CanonicalJsonObject(li?.RecipeAttributes),
+                                       CanonicalJsonObject(ri?.RecipeAttributes), StringComparison.Ordinal)) return false;
+                }
+                return true;
+            }
+            catch { return false; }
+        }
+
+        static string ReturnedStackKey(JsonItemStack stack)
+        {
+            if (stack == null) return string.Empty;
+            try
+            {
+                return (stack.Type.ToString() ?? string.Empty) + "|" +
+                    (stack.Code?.ToString() ?? string.Empty) + "|" +
+                    stack.StackSize.ToString(CultureInfo.InvariantCulture) + "|" +
+                    CanonicalJsonObject(stack.Attributes);
+            }
+            catch { return "<unresolved-return-stack>"; }
+        }
+
+        static string CanonicalJsonObject(JsonObject value)
+        {
+            try
+            {
+                string json = value?.Token?.ToString() ?? string.Empty;
+                json = json.Trim();
+                // Una propiedad Attributes vacía equivale a no declarar ninguna condición.
+                if (json.Length == 0 || string.Equals(json, "{}", StringComparison.Ordinal) ||
+                    string.Equals(json, "null", StringComparison.OrdinalIgnoreCase)) return string.Empty;
+                return json;
+            }
+            catch { return "<unreadable-json-attributes>"; }
+        }
+
+        bool OutputsDemonstrablyEquivalent(ItemStack a, ItemStack b)
+        {
+            if (a?.Collectible == null || b?.Collectible == null || a.StackSize != b.StackSize) return false;
+            try
+            {
+                // Unlike the inventory-transfer comparator, this comparison includes the
+                // requested stack size. Compare clones so a custom collectible cannot
+                // mutate catalog-owned output stacks during equality evaluation.
+                ItemStack left = a.Clone();
+                ItemStack right = b.Clone();
+                return left.Equals(capi?.World, right);
+            }
+            catch { return false; }
+        }
+
+        static string RecipeVariantInfoText(CompactRecipe recipe, RecipeVariantDisplayGroup group)
+        {
+            if (group == null || group.RecipeIndexes.Count < 2)
+                return recipe?.Name ?? string.Empty;
+            return (recipe?.Name ?? string.Empty) + "\n" + HandbookOptLang.Get(
+                "recipe-variants-info", group.ActiveVariantIndex + 1, group.RecipeIndexes.Count);
+        }
+
+        void EnsureRecipeVariantsBadgeTexture()
+        {
+            if (recipeVariantsBadgeLoadAttempted) return;
+            recipeVariantsBadgeLoadAttempted = true;
+            try
+            {
+                recipeVariantsBadgeTexture = capi.Gui.LoadSvg(
+                    new AssetLocation("handbookopt:textures/gui/recipe-variants-badge.svg"), 32, 32, 32, 32);
+                if (recipeVariantsBadgeTexture == null || recipeVariantsBadgeTexture.TextureId <= 0)
+                    capi.Logger.Warning("[HandbookOpt] No se pudo cargar la insignia de recetas alternativas; la rotación seguirá disponible sin insignia.");
+            }
+            catch (Exception e)
+            {
+                capi.Logger.Warning("[HandbookOpt] Error al cargar la insignia de recetas alternativas: {0}", e.Message);
+            }
+        }
+
+        const long RecipeVariantSlideIntervalMs = 2000;
+
+        void UpdateRecipeVariantCarousel()
+        {
+            if (!IsOpened() || !HandbookOptMod.IndexReady || IsGuideBrowserInFront() || IsModFilterPopupOpen()) return;
+            long now = capi?.ElapsedMilliseconds ?? 0;
+            int from = page * PageSize;
+            int to = Math.Min(matchVariantGroups.Count, from + PageSize);
+            for (int abs = from; abs < to; abs++)
+            {
+                RecipeVariantDisplayGroup group = matchVariantGroups[abs];
+                if (group == null || group.RecipeIndexes.Count < 2) continue;
+
+                // Iniciar el plazo ANTES de procesar hover. Si el cursor cae sobre una
+                // ficha recién compuesta, NextSlideAt aún vale cero; guardar 1 ms aquí
+                // hacía que la variante cambiara inmediatamente al retirar el cursor.
+                if (group.NextSlideAt <= 0)
+                    group.NextSlideAt = now + RecipeVariantSlideIntervalMs;
+
+                bool hovered = hoveredRecipeMatchIndex == abs;
+                if (hovered)
+                {
+                    if (!group.IsPaused)
+                    {
+                        group.RemainingWhenPaused = Math.Max(1, group.NextSlideAt - now);
+                        group.IsPaused = true;
+                    }
+                    continue;
+                }
+
+                if (group.IsPaused)
+                {
+                    group.IsPaused = false;
+                    group.NextSlideAt = now + Math.Max(1, group.RemainingWhenPaused);
+                    group.RemainingWhenPaused = 0;
+                }
+                if (now < group.NextSlideAt) continue;
+
+                group.ActiveVariantIndex = (group.ActiveVariantIndex + 1) % group.RecipeIndexes.Count;
+                int recipeIndex = group.RecipeIndexes[group.ActiveVariantIndex];
+                CompactRecipe recipe = CraftCatalog.Recipes[recipeIndex];
+                matches[abs] = recipeIndex;
+                times[abs] = group.TimesByRecipe.TryGetValue(recipeIndex, out int n) ? n : 0;
+                group.NextSlideAt = now + RecipeVariantSlideIntervalMs;
+                try
+                {
+                    if (group.DisplaySlot != null) group.DisplaySlot.Itemstack = recipe.Output?.Clone();
+                    if (group.VisibleSkill != null)
+                    {
+                        group.VisibleSkill.Code = recipe.Output?.Collectible?.Code;
+                        group.VisibleSkill.Name = recipe.Name + " · " + HandbookOptLang.Get("recipe-variants-info-short",
+                            group.ActiveVariantIndex + 1, group.RecipeIndexes.Count);
+                    }
+                }
+                catch { /* no permitir que la actualización visual interrumpa la interfaz */ }
+            }
         }
 
         bool PassSearch(CompactRecipe rec)
@@ -2407,10 +3016,12 @@ namespace HandbookOpt
             bool showPause = HandbookOptPauseController.CanPause(capi);
             double pauseRow = showPause ? 36 : 0;
             double dlgW = Math.Max(gridW + 28, 360);
-            // Se amplía moderadamente la parte inferior para dar dos renglones al nombre
-            // de la receta y desplazar las instrucciones hacia abajo sin alargar demasiado
-            // la ventana.
-            double dlgH = gridH + 178 + pauseRow;
+            // Altura base del selector. La extensión adicional se aplica únicamente
+            // al borde inferior: conserva la posición superior y deja más espacio debajo
+            // de las instrucciones para que no queden pegadas ni recortadas por el marco.
+            double baseDlgH = gridH + 178 + pauseRow;
+            double dlgH = baseDlgH;
+            double bottomExtension = 0;
 
             double x = 16;
             double y = 70;
@@ -2424,6 +3035,16 @@ namespace HandbookOpt
                 y = invTop;
                 if (x < 8) x = 8;
             }
+
+            // Añade hasta 28 unidades hacia abajo, sin mover el borde superior.
+            // Limitamos la extensión al espacio real disponible en pantalla para no
+            // hacer que el selector quede inaccesible en resoluciones bajas o con UI scale alto.
+            double guiScaleForHeight = Math.Max(0.01, RuntimeEnv.GUIScale);
+            double screenHeight = capi.Render.FrameHeight / guiScaleForHeight;
+            const double requestedBottomExtension = 28;
+            double availableBelow = Math.Max(0, screenHeight - y - baseDlgH - 8);
+            bottomExtension = Math.Min(requestedBottomExtension, availableBelow);
+            dlgH = baseDlgH + bottomExtension;
 
             ElementBounds dialogBounds = ElementBounds.Fixed(x, y, dlgW, dlgH);
             ElementBounds bg = ElementBounds.Fill;
@@ -2441,8 +3062,10 @@ namespace HandbookOpt
             ElementBounds infoB = ElementBounds.Fixed(50, 80 + pauseRow + gridH, dlgW - 100, 44);
             // Las instrucciones ocupan dos líneas independientes. La última queda algo
             // más abajo para reservar sitio al nombre largo del objeto.
-            ElementBounds hintFirstB = ElementBounds.Fixed(10, dlgH - 51, dlgW - 20, 18);
-            ElementBounds hintLastB = ElementBounds.Fixed(10, dlgH - 29, dlgW - 20, 20);
+            // Las instrucciones permanecen en su posición actual; el espacio extra queda
+            // debajo de ellas, alargando el panel hacia abajo sin descolocar el texto.
+            ElementBounds hintFirstB = ElementBounds.Fixed(10, dlgH - bottomExtension - 51, dlgW - 20, 18);
+            ElementBounds hintLastB = ElementBounds.Fixed(10, dlgH - bottomExtension - 29, dlgW - 20, 20);
 
             int from = page * PageSize;
             shown = new List<SkillItem>();
@@ -2450,6 +3073,12 @@ namespace HandbookOpt
             int take = Math.Min(PageSize, Math.Max(0, matches.Count - from));
             bool catalogMode = IsBrowsingRecipeCatalog();
             if (catalogMode) EnsureUnavailableRecipeTexture();
+            bool anyVisibleVariants = false;
+            for (int i = from; i < from + take && i < matchVariantGroups.Count; i++)
+            {
+                if (matchVariantGroups[i]?.RecipeIndexes.Count > 1) { anyVisibleVariants = true; break; }
+            }
+            if (anyVisibleVariants) EnsureRecipeVariantsBadgeTexture();
             // Solo calcular la disponibilidad de los 24 iconos visibles. Evaluar miles
             // de recetas a la vez ralentizaría cada cambio de filtro.
             Dictionary<int, int> ownedForHighlight = catalogMode && take > 0 && HandbookOptMod.IndexReady
@@ -2460,6 +3089,9 @@ namespace HandbookOpt
             {
                 int mi = from + i;
                 var rec = CraftCatalog.Recipes[matches[mi]];
+                RecipeVariantDisplayGroup displayGroup = mi < matchVariantGroups.Count
+                    ? matchVariantGroups[mi]
+                    : null;
                 int n = times[mi];
                 bool isCraftable = n > 0;
                 if (catalogMode && ownedForHighlight != null)
@@ -2469,18 +3101,30 @@ namespace HandbookOpt
                 }
                 shownCraftable.Add(isCraftable);
                 var dummy = new DummySlot(rec.Output.Clone());
+                if (displayGroup != null)
+                {
+                    displayGroup.DisplaySlot = dummy;
+                    displayGroup.VisibleSkill = null;
+                    displayGroup.NextSlideAt = 0;
+                    displayGroup.RemainingWhenPaused = 0;
+                    displayGroup.IsPaused = false;
+                }
+                bool hasOutputVariants = displayGroup != null && displayGroup.RecipeIndexes.Count > 1;
                 bool dimUnavailable = catalogMode && !isCraftable;
                 var skill = new SkillItem
                 {
                     Code = rec.Output.Collectible.Code,
-                    // El tooltip nativo del icono muestra únicamente el nombre del objeto.
-                    Name = rec.Name,
+                    // El nombre también anuncia la variante activa cuando el tooltip estándar aparece.
+                    Name = hasOutputVariants
+                        ? rec.Name + " · " + HandbookOptLang.Get("recipe-variants-info-short", displayGroup.ActiveVariantIndex + 1, displayGroup.RecipeIndexes.Count)
+                        : rec.Name,
                     Data = isCraftable,
                     RenderHandler = (code, dt2, px, py) =>
                     {
                         float size = (float)GuiElement.scaled(32);
                         float tileSize = (float)GuiElement.scaled(GuiElementPassiveItemSlot.unscaledSlotSize);
-                        capi.Render.RenderItemstackToGui(dummy, px + size * 0.55, py + size * 0.55, 80, size, ColorUtil.WhiteArgb, true, false, false);
+                        DummySlot currentSlot = displayGroup?.DisplaySlot ?? dummy;
+                        capi.Render.RenderItemstackToGui(currentSlot, px + size * 0.55, py + size * 0.55, 80, size, ColorUtil.WhiteArgb, true, false, false);
 
                         // En el catálogo de mods se oscurecen las recetas que no pueden
                         // fabricarse con el inventario actual. El degradado se dibuja
@@ -2491,8 +3135,23 @@ namespace HandbookOpt
                             capi.Render.Render2DTexturePremultipliedAlpha(
                                 unavailableRecipeTexture.TextureId, px - 1, py - 1, tileSize, tileSize, 90f);
                         }
+
+                        // Insignia visible: this one tile rotates between distinct output recipes.
+                        if (hasOutputVariants && recipeVariantsBadgeTexture != null && recipeVariantsBadgeTexture.TextureId > 0)
+                        {
+                            // Tiny yellow corner triangle: marks variant tiles without
+                            // covering the output icon or changing the carousel behavior.
+                            float badgeW = (float)GuiElement.scaled(14);
+                            float badgeH = (float)GuiElement.scaled(14);
+                            capi.Render.Render2DTexturePremultipliedAlpha(
+                                recipeVariantsBadgeTexture.TextureId,
+                                px + tileSize - badgeW + 1,
+                                py + 1,
+                                badgeW, badgeH, 95f);
+                        }
                     }
                 };
+                if (displayGroup != null) displayGroup.VisibleSkill = skill;
                 shown.Add(skill);
             }
 
@@ -2575,13 +3234,14 @@ namespace HandbookOpt
 
             hoveredRecipeMatchIndex = abs;
             var rec = CraftCatalog.Recipes[matches[abs]];
+            RecipeVariantDisplayGroup group = abs < matchVariantGroups.Count ? matchVariantGroups[abs] : null;
             bool canCraft = index >= 0 && index < shownCraftable.Count && shownCraftable[index];
             hoverTooltip?.SetRecipe(rec, matches[abs], canCraft);
             try
             {
-                // La línea central solo identifica el objeto; no anuncia cuántas tandas
-                // se pueden cargar con el inventario actual.
-                SingleComposer.GetDynamicText("info")?.SetNewText(rec?.Name ?? string.Empty);
+                // En una entrada agrupada la línea secundaria muestra qué salida exacta
+                // está seleccionada; el clic utilizará precisamente este índice.
+                SingleComposer.GetDynamicText("info")?.SetNewText(RecipeVariantInfoText(rec, group));
             }
             catch { }
         }
@@ -2840,6 +3500,7 @@ namespace HandbookOpt
                 }
                 else
                 {
+                    SelectLoadedRecipeVariant(rec);
                     lastPanelRecipeIndex = selectedRecipeIndex;
                     capi.Gui.PlaySound("tick");
                     if (!fillAll && switchedLoaded < RequestedTandadasPerClick)
@@ -2860,6 +3521,7 @@ namespace HandbookOpt
                 }
                 else
                 {
+                    SelectLoadedRecipeVariant(rec);
                     lastPanelRecipeIndex = selectedRecipeIndex;
                     capi.Gui.PlaySound("tick");
                     if (completedTimes < stagedTarget)
@@ -2892,6 +3554,7 @@ namespace HandbookOpt
             }
             else
             {
+                SelectLoadedRecipeVariant(rec);
                 lastPanelRecipeIndex = selectedRecipeIndex;
                 // PullInto usa el gestor de inventario del jugador y envía al servidor
                 // los paquetes devueltos por TryTransferTo.
@@ -2900,6 +3563,19 @@ namespace HandbookOpt
                     capi.TriggerIngameError(this, "partialfill", HandbookOptLang.Get("error-partial-fill", loaded, requested));
             }
             MarkDirty();
+        }
+
+        void SelectLoadedRecipeVariant(CompactRecipe recipe)
+        {
+            if (recipe?.Recipe == null) return;
+            // After ingredients have been transferred, set the actual native matching
+            // recipe on the client and then notify the server. This is intentionally not
+            // a fake output icon: CraftingGridPatch revalidates recipe.Matches before
+            // using the game's normal FoundMatch path on each side.
+            if (!CraftingGridPatch.ApplyClientRecipeSelection(recipe.Recipe))
+            {
+                capi?.Logger?.Debug("[HandbookOpt] La receta {0} aún no coincide con la cuadrícula completa; se conservará la selección nativa hasta que haya ingredientes suficientes.", recipe.Recipe.Name);
+            }
         }
 
         bool CheckRequiredTrait(CompactRecipe recipe)
@@ -3682,6 +4358,8 @@ namespace HandbookOpt
             hoverTooltip = null;
             try { unavailableRecipeTexture?.Dispose(); } catch { }
             unavailableRecipeTexture = null;
+            try { recipeVariantsBadgeTexture?.Dispose(); } catch { }
+            recipeVariantsBadgeTexture = null;
             base.Dispose();
         }
     }

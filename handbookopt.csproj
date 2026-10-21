@@ -26,6 +26,16 @@
       <HintPath>$(VintageStoryPath)\VintagestoryAPI.dll</HintPath>
       <Private>false</Private>
     </Reference>
+    <!-- The Vintage Story API exposes JsonObject.Token as Newtonsoft.Json.Linq.JToken.
+         Reference the game's own Newtonsoft.Json assembly instead of copying another version. -->
+    <Reference Include="Newtonsoft.Json" Condition="Exists('$(VintageStoryPath)\Lib\Newtonsoft.Json.dll')">
+      <HintPath>$(VintageStoryPath)\Lib\Newtonsoft.Json.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Newtonsoft.Json" Condition="!Exists('$(VintageStoryPath)\Lib\Newtonsoft.Json.dll') and Exists('$(VintageStoryPath)\Newtonsoft.Json.dll')">
+      <HintPath>$(VintageStoryPath)\Newtonsoft.Json.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
     <Reference Include="VintagestoryLib">
       <HintPath>$(VintageStoryPath)\VintagestoryLib.dll</HintPath>
       <Private>false</Private>
@@ -36,6 +46,14 @@
     </Reference>
     <Reference Include="0Harmony">
       <HintPath>$(VintageStoryPath)\Lib\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="protobuf-net" Condition="Exists('$(VintageStoryPath)\Lib\protobuf-net.dll')">
+      <HintPath>$(VintageStoryPath)\Lib\protobuf-net.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="protobuf-net" Condition="!Exists('$(VintageStoryPath)\Lib\protobuf-net.dll') and Exists('$(VintageStoryPath)\protobuf-net.dll')">
+      <HintPath>$(VintageStoryPath)\protobuf-net.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="cairo-sharp">
@@ -60,6 +78,9 @@
     <Error
       Condition="!Exists('$(VintageStoryPath)\Lib\0Harmony.dll')"
       Text="Falta Lib\0Harmony.dll en '$(VintageStoryPath)'. Comprueba que VintageStoryPath apunte a la carpeta de instalación del juego." />
+    <Error
+      Condition="!Exists('$(VintageStoryPath)\Lib\Newtonsoft.Json.dll') and !Exists('$(VintageStoryPath)\Newtonsoft.Json.dll')"
+      Text="Falta Newtonsoft.Json.dll. Se esperaba en '$(VintageStoryPath)\Lib\Newtonsoft.Json.dll' (o en la raíz del juego). Esta referencia es necesaria para compilar el acceso a JsonObject.Token de Vintage Story." />
     <Error
       Condition="!Exists('$(VintageStoryPath)\Lib\cairo-sharp.dll')"
       Text="Falta Lib\cairo-sharp.dll en '$(VintageStoryPath)'. El tooltip de recetas utiliza Cairo para dibujar su textura; comprueba que la ruta apunte a la instalación completa del juego." />

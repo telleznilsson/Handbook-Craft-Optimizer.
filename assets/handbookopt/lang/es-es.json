@@ -6,8 +6,8 @@
   "indexing-recipes-percent": "Indexando recetas… {0}%",
   "filter-no-grid-recipes": "Este filtro no contiene recetas de cuadrícula",
   "nothing-craftable": "Nada crafteable ahora",
-  "recipe-catalog-hint": "Oscuro: faltan materiales · Cursor: ingredientes\nClic: añadir 1 · Mayús+clic: cargar máximo",
-  "available-recipes-hint": "Cursor: ingredientes · Clic: añadir 1 tanda\nMayús+clic: cargar máximo de tandas",
+  "recipe-catalog-hint": "Oscuro: faltan materiales · ALT: salidas diferentes\nCursor: ingredientes · clic: añadir 1 · Mayús+clic: máximo",
+  "available-recipes-hint": "ALT: las salidas rotan cada 2 s; el cursor pausa\nCursor: ingredientes · clic: añadir 1 tanda · Mayús+clic: máximo",
   "recipe-panel-title": "Recetas de fabricación",
   "recipe-search-placeholder": "Buscar…",
   "error-switch-recipe": "No se pudo cambiar de receta.",
@@ -49,5 +49,7 @@
   "hover-tooltip-sample-missing": "No se encontró una muestra visual para este requisito",
   "hover-tooltip-pattern-code": "Identificador del ingrediente: {0}",
   "hover-tooltip-variant-slide": "Muestra compatible {0}/{1} · cambia cada segundo",
-  "hover-tooltip-unlocalized-item": "Objeto sin nombre traducido"
+  "hover-tooltip-unlocalized-item": "Objeto sin nombre traducido",
+  "recipe-variants-info": "Salida alternativa {0}/{1} · clic para cargar esta receta",
+  "recipe-variants-info-short": "ALT {0}/{1}"
 }

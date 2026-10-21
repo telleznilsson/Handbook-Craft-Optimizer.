@@ -5,8 +5,8 @@
   "authors": [
     "Nilsson"
   ],
-  "description": "Enhances crafting and handbook usability with a searchable, paginated recipe browser, one-click crafting grid filling, bulk ingredient transfer, compact ingredient tooltips with grouped quantities and rotating variant previews, and a searchable mod guide browser. Preserves the vanilla Handbook and supports recipes from both vanilla and mods.",
-  "version": "1.5.1",
+  "description": "Enhances crafting and handbook usability with a searchable, paginated recipe browser, one-click crafting grid filling, bulk ingredient transfer, ingredient tooltips, grouped alternative-output recipe tiles with a small blue corner marker that rotate every 2 seconds and pause on hover, and a searchable mod guide browser. Clicking a visible variant loads that exact recipe through the native crafting grid and server validation. Preserves the vanilla Handbook and supports recipes from both vanilla and mods.",
+  "version": "1.5.3-pre.17",
   "side": "Universal",
   "dependencies": {
     "game": "1.22.7"

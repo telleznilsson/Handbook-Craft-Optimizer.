@@ -1,4 +1,5 @@
 using System;
+using System.Collections;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Reflection;
@@ -31,6 +32,10 @@ namespace HandbookOpt
         public static Harmony HarmonyInst;
         public static Harmony GridHarmony;
         public static bool GridPatchInstalled;
+        const string RecipeVariantChannelName = "handbookopt-recipevariants";
+        static IClientNetworkChannel recipeVariantClientChannel;
+        static IServerNetworkChannel recipeVariantServerChannel;
+        static long recipeVariantTickListener;
         static readonly object GridPatchLock = new object();
         static readonly object ServerIndexLock = new object();
         static int ServerIndexGeneration;
@@ -71,6 +76,16 @@ namespace HandbookOpt
             public GridRecipeIndex Index;
             public GridRecipe Previous;
             public string GridKey;
+            // Ingredient identity by grid position, deliberately excluding stack counts and
+            // mutable tool durability/attributes so batch crafting can retain a selected recipe.
+            public string GridCompositionKey;
+            // All distinct, currently matching outputs in native recipe order.
+            public List<GridRecipe> MatchingRecipes;
+            public int ActiveRecipeIndex = -1;
+            public long NextVariantAt;
+            public long LastCarouselTickAt;
+            // Server-only sticky selection accepted from the client's output carousel.
+            public bool ExplicitServerSelection;
         }
 
         // Este mod debe ejecutarse en cliente y servidor: la búsqueda nativa de recetas
@@ -81,6 +96,19 @@ namespace HandbookOpt
         {
             CoreApi = api;
             Capi = api;
+            try
+            {
+                recipeVariantClientChannel = api.Network.RegisterChannel(RecipeVariantChannelName);
+                recipeVariantClientChannel.RegisterMessageType<RecipeVariantSelectionPacket>();
+            }
+            catch (Exception e)
+            {
+                recipeVariantClientChannel = null;
+                api.Logger.Warning("[HandbookOpt] No se pudo registrar el canal de selección de recetas alternativas; se conservará la receta nativa: {0}", e.Message);
+            }
+            // La rotación ahora vive en el mosaico de recetas alternativas del selector,
+            // no en la casilla de salida nativa de la cuadrícula. El resultado de crafteo
+            // se mantiene estable; al hacer clic se aplica una receta concreta.
             HarmonyInst = new Harmony(HarmonyId);
             try
             {
@@ -121,6 +149,17 @@ namespace HandbookOpt
         {
             CoreApi = api;
             ServerApi = api;
+            try
+            {
+                recipeVariantServerChannel = api.Network.RegisterChannel(RecipeVariantChannelName);
+                recipeVariantServerChannel.RegisterMessageType<RecipeVariantSelectionPacket>();
+                recipeVariantServerChannel.SetMessageHandler<RecipeVariantSelectionPacket>(OnRecipeVariantSelectionPacket);
+            }
+            catch (Exception e)
+            {
+                recipeVariantServerChannel = null;
+                api.Logger.Warning("[HandbookOpt] No se pudo registrar el canal de selección de recetas alternativas; se conservará la receta nativa: {0}", e.Message);
+            }
             EnsureGridPatch(api);
             // El servidor usa fases de ejecución; LevelFinalize/LeaveWorld son eventos
             // del cliente y no existen en IServerEventAPI en Vintage Story 1.22.7.
@@ -197,6 +236,38 @@ namespace HandbookOpt
         private void OnServerLevelFinalize()
         {
             BeginServerIndexBuild(ServerApi);
+        }
+
+        static void OnRecipeVariantSelectionPacket(IPlayer fromPlayer, RecipeVariantSelectionPacket packet)
+        {
+            try
+            {
+                if (fromPlayer == null || packet == null || string.IsNullOrWhiteSpace(packet.RecipeKey)) return;
+                CraftingGridPatch.ApplyServerRecipeSelection(fromPlayer, packet.RecipeKey);
+            }
+            catch (Exception e)
+            {
+                try { ServerApi?.Logger?.Debug("[HandbookOpt] Se descartó una selección de receta alternativa no aplicable: {0}", e.Message); }
+                catch { }
+            }
+        }
+
+        public static bool RecipeVariantClientChannelAvailable => recipeVariantClientChannel != null;
+
+        public static void SendRecipeVariantSelection(GridRecipe recipe)
+        {
+            try
+            {
+                if (recipeVariantClientChannel == null || recipe == null) return;
+                string key = CraftingGridPatch.RecipeIdentity(recipe);
+                if (string.IsNullOrWhiteSpace(key)) return;
+                recipeVariantClientChannel.SendPacket(new RecipeVariantSelectionPacket { RecipeKey = key });
+            }
+            catch (Exception e)
+            {
+                try { Capi?.Logger?.Debug("[HandbookOpt] No se pudo sincronizar la receta mostrada en el carrusel: {0}", e.Message); }
+                catch { }
+            }
         }
 
         private void OnServerLeaveWorld()
@@ -304,6 +375,13 @@ namespace HandbookOpt
 
         public override void Dispose()
         {
+            if (recipeVariantTickListener != 0)
+            {
+                try { Capi?.Event?.UnregisterGameTickListener(recipeVariantTickListener); } catch { }
+                recipeVariantTickListener = 0;
+            }
+            recipeVariantClientChannel = null;
+            recipeVariantServerChannel = null;
             HandbookOptPauseController.Reset(Capi);
             try { HarmonyInst?.UnpatchAll(HarmonyId); } catch { /* ignore */ }
             try { GuideBrowser?.Dispose(); } catch { }
@@ -328,6 +406,11 @@ namespace HandbookOpt
         public readonly Dictionary<int, List<GridRecipe>> RecipesByItemId;
         public readonly Dictionary<GridRecipe, int> RecipeOrder;
         public readonly List<GridRecipe> WildcardRecipes;
+        // Precomputed recipe-identity lookup: server selection packets must not rescan
+        // thousands of recipes and rebuild output signatures every two seconds. The main
+        // map stores one recipe per key; a list is allocated only for actual key collisions.
+        public readonly Dictionary<string, GridRecipe> RecipeByIdentity;
+        public readonly Dictionary<string, List<GridRecipe>> DuplicateRecipesByIdentity;
         public readonly bool IsReady;
 
         public GridRecipeIndex(IWorldAccessor world, int sourceRecipeCount,
@@ -340,6 +423,25 @@ namespace HandbookOpt
             RecipesByItemId = recipesByItemId ?? new Dictionary<int, List<GridRecipe>>();
             RecipeOrder = recipeOrder ?? new Dictionary<GridRecipe, int>();
             WildcardRecipes = wildcardRecipes ?? new List<GridRecipe>();
+            RecipeByIdentity = new Dictionary<string, GridRecipe>(RecipeOrder.Count, StringComparer.Ordinal);
+            DuplicateRecipesByIdentity = new Dictionary<string, List<GridRecipe>>(StringComparer.Ordinal);
+            foreach (KeyValuePair<GridRecipe, int> entry in RecipeOrder)
+            {
+                string key = CraftingGridPatch.RecipeIdentity(entry.Key);
+                if (string.IsNullOrEmpty(key)) continue;
+                if (!RecipeByIdentity.TryGetValue(key, out GridRecipe existing))
+                {
+                    RecipeByIdentity[key] = entry.Key;
+                    continue;
+                }
+
+                if (!DuplicateRecipesByIdentity.TryGetValue(key, out List<GridRecipe> duplicates))
+                {
+                    duplicates = new List<GridRecipe>(2) { existing };
+                    DuplicateRecipesByIdentity[key] = duplicates;
+                }
+                duplicates.Add(entry.Key);
+            }
             IsReady = world != null;
         }
     }
@@ -858,61 +960,79 @@ namespace HandbookOpt
 
                 if (!TryResolveContext(inv, out IPlayer player, out IWorldAccessor world, out GridRecipeIndex index))
                     return true;
-                if (index == null || !index.IsReady || index.RecipesByItemId == null)
+                if (world?.GridRecipes == null) return true;
+                bool indexUsable = index != null && index.IsReady && index.RecipesByItemId != null
+                    && ReferenceEquals(index.World, world) && world.GridRecipes.Count == index.SourceRecipeCount;
+
+                if (!TryReadGrid(inv, out ItemSlot[] slots, out HashSet<int> filledIds, out int filled, out int gridWidth, out string gridKey))
                     return true;
-                if (!ReferenceEquals(index.World, world) || world?.GridRecipes == null || world.GridRecipes.Count != index.SourceRecipeCount)
-                {
-                    return true;
-                }
-
-                int count = inv.Count;
-                if (count < 2) return true;
-                int slotCount = count - 1;
-                int gridWidth = (int)Math.Sqrt(slotCount);
-                if (gridWidth * gridWidth != slotCount) return true;
-
-                var slots = new ItemSlot[slotCount];
-                var filledIds = new HashSet<int>();
-                int filled = 0;
-                var keySb = new StringBuilder(slotCount * 10);
-                for (int i = 0; i < slotCount; i++)
-                {
-                    ItemSlot slot = inv[i];
-                    slots[i] = slot;
-                    ItemStack stack = slot?.Itemstack;
-                    if (stack?.Collectible != null && stack.StackSize > 0)
-                    {
-                        int id = CraftCatalog.Pack(stack.Collectible);
-                        filledIds.Add(id);
-                        filled++;
-                        // No se usa GetHashCode como criterio de identidad de la receta;
-                        // StackSize + atributos representados en el stack ayudan a evitar
-                        // reutilizar una entrada anterior después de mover una pila.
-                        keySb.Append(id).Append('x').Append(stack.StackSize).Append('#')
-                             .Append(stack.GetHashCode()).Append('#')
-                             .Append(stack.Attributes?.GetHashCode() ?? 0).Append(';');
-                    }
-                    else keySb.Append("0;");
-                }
-
+                int slotCount = slots.Length;
                 ItemSlot outputSlot = inv[slotCount];
                 if (outputSlot == null) return true;
 
-                string gridKey = keySb.ToString();
                 HandbookOptMod.GridSearchState state = HandbookOptMod.GridStates.GetValue(__instance, _ => new HandbookOptMod.GridSearchState());
+                bool sameGrid = state.GridKey == gridKey;
+                string compositionKey = BuildGridCompositionKey(slots);
+                bool sameComposition = !string.IsNullOrEmpty(state.GridCompositionKey)
+                    && string.Equals(state.GridCompositionKey, compositionKey, StringComparison.Ordinal);
+
+                // Bulk crafting changes stack counts (and hammer durability) after each craft.
+                // Keep the selected recipe when the same ingredient types remain in the same
+                // slots and that recipe still matches. A genuinely different grid or an invalid
+                // selected recipe still resets the chooser to native catalog order.
+                bool preserveSelectionAcrossCountChange = !sameGrid && sameComposition
+                    && state.Previous != null && state.Previous.Enabled
+                    && state.Previous.Matches(player, world, slots, gridWidth);
+                if (!sameGrid && !preserveSelectionAcrossCountChange)
+                {
+                    state.Previous = null;
+                    state.MatchingRecipes = null;
+                    state.ActiveRecipeIndex = -1;
+                    state.NextVariantAt = 0;
+                    state.LastCarouselTickAt = 0;
+                    state.ExplicitServerSelection = false;
+                }
+                else if (preserveSelectionAcrossCountChange)
+                {
+                    state.GridKey = gridKey;
+                    state.NextVariantAt = 0;
+                    state.LastCarouselTickAt = 0;
+                }
                 if (!ReferenceEquals(state.Index, index))
                 {
+                    bool preserveServerSelection = state.ExplicitServerSelection
+                        && (sameGrid || preserveSelectionAcrossCountChange)
+                        && state.Previous != null && ContainsRecipeReference(world.GridRecipes, state.Previous);
                     state.Index = index;
-                    state.Previous = null;
-                    state.GridKey = null;
+                    if (!preserveServerSelection)
+                    {
+                        state.Previous = null;
+                        state.GridKey = null;
+                        state.MatchingRecipes = null;
+                        state.ActiveRecipeIndex = -1;
+                        state.NextVariantAt = 0;
+                        state.LastCarouselTickAt = 0;
+                        state.ExplicitServerSelection = false;
+                    }
                 }
+                state.GridCompositionKey = compositionKey;
 
-                // Atajo para llamadas repetidas con la misma configuración. Aun así se
-                // revalida la receta en vivo para respetar ingredientes con atributos.
+                // Reusar a receita seleccionada, inclusive cuando la selección actual llegó
+                // desde el carrusel del cliente. FoundMatch mantiene la salida nativa y su
+                // consumo; no escribimos Itemstack manualmente en la ranura de resultado.
                 if (state.Previous != null && state.GridKey == gridKey && state.Previous.Enabled)
                 {
                     if (state.Previous.Matches(player, world, slots, gridWidth) && InvokeNativeFoundMatch(__instance, state.Previous))
                         return false;
+                }
+
+                // The asynchronous index can still be building just after world entry.
+                // Preserve a recipe already validated by the network handler, but otherwise
+                // leave initial matching to vanilla until the optimization index is ready.
+                if (!indexUsable)
+                {
+                    state.GridKey = gridKey;
+                    return true;
                 }
 
                 if (filled == 0)
@@ -920,11 +1040,17 @@ namespace HandbookOpt
                     ClearNativeMatchState(__instance, outputSlot);
                     state.Previous = null;
                     state.GridKey = gridKey;
+                    state.MatchingRecipes = null;
+                    state.ActiveRecipeIndex = -1;
+                    state.NextVariantAt = 0;
+                    state.LastCarouselTickAt = 0;
+                    state.ExplicitServerSelection = false;
                     return false;
                 }
 
-                // Candidatos a partir de los IDs exactos presentes, sin escanear todos los
-                // tipos de ingrediente y sin List.AddIfNotPresent (la ruta O(n²) nativa).
+                // Candidatos desde el índice por IDs exactos. La verificación final sigue
+                // usando GridRecipe.Matches para conservar comodines, tags, atributos,
+                // formas y reglas propias de los mods.
                 var candidateSet = new HashSet<GridRecipe>();
                 foreach (int id in filledIds)
                 {
@@ -936,11 +1062,8 @@ namespace HandbookOpt
 
                 if (candidateSet.Count == 0)
                 {
-                    // El índice está completo: no hay receta que pueda satisfacer una
-                    // cuadrícula con estos IDs. No delegar el caso negativo al escaneo total.
                     ClearNativeMatchState(__instance, outputSlot);
-                    state.Previous = null;
-                    state.GridKey = gridKey;
+                    ClearRecipeMatches(state, gridKey);
                     return false;
                 }
 
@@ -952,40 +1075,578 @@ namespace HandbookOpt
                     return ai.CompareTo(bi);
                 });
 
-                GridRecipe found = null;
+                // Collect every live match, not just the first. Remove only recipes whose
+                // resolved outputs are demonstrably identical, so the carousel represents
+                // visibly distinct results without rescanning the catalogue every frame.
+                var variants = new List<GridRecipe>(4);
                 for (int i = 0; i < candidates.Count; i++)
                 {
                     GridRecipe recipe = candidates[i];
                     if (recipe == null || !recipe.Enabled) continue;
                     if (!HasAllExactIngredientsPresent(recipe, filledIds, gridWidth)) continue;
-                    if (recipe.Matches(player, world, slots, gridWidth))
+                    if (!recipe.Matches(player, world, slots, gridWidth)) continue;
+                    if (HasDistinctOutput(variants, recipe, world)) variants.Add(recipe);
+                }
+
+                // If a custom recipe cannot produce a stable cross-endpoint identity, keep
+                // the native first result but do not rotate through recipes that the server
+                // cannot unambiguously identify. Better no carousel than a mismatched craft.
+                bool canSynchronizeVariants = true;
+                for (int i = 0; i < variants.Count; i++)
+                {
+                    if (string.IsNullOrEmpty(RecipeIdentity(variants[i])))
                     {
-                        found = recipe;
+                        canSynchronizeVariants = false;
                         break;
                     }
                 }
 
+                GridRecipe found = variants.Count > 0 ? variants[0] : null;
                 if (found != null)
                 {
-                    // Mantener el ciclo nativo de salida. Si FoundMatch no está presente
-                    // en este build del juego o falla, dejamos que el juego resuelva todo.
+                    // Mantener la salida nativa en ambos extremos. El primer resultado
+                    // conserva el orden del catálogo; el temporizador cliente iniciará
+                    // después el pase por las salidas alternativas cada 2 segundos.
                     if (!InvokeNativeFoundMatch(__instance, found)) return true;
                     state.Previous = found;
                     state.GridKey = gridKey;
+                    state.MatchingRecipes = canSynchronizeVariants ? variants : null;
+                    state.ActiveRecipeIndex = 0;
+                    state.NextVariantAt = 0;
+                    state.LastCarouselTickAt = 0;
+                    state.ExplicitServerSelection = false;
                     return false;
                 }
 
                 // Índice completo + ninguna candidata válida: reflejar el estado nativo
                 // de "sin receta" sin ejecutar la búsqueda global que acabamos de evitar.
                 ClearNativeMatchState(__instance, outputSlot);
-                state.Previous = null;
-                state.GridKey = gridKey;
+                ClearRecipeMatches(state, gridKey);
                 return false;
             }
             catch
             {
                 return true;
             }
+        }
+
+        static void ClearRecipeMatches(HandbookOptMod.GridSearchState state, string gridKey)
+        {
+            if (state == null) return;
+            state.Previous = null;
+            state.GridKey = gridKey;
+            state.MatchingRecipes = null;
+            state.ActiveRecipeIndex = -1;
+            state.NextVariantAt = 0;
+            state.LastCarouselTickAt = 0;
+            state.ExplicitServerSelection = false;
+        }
+
+        static bool HasDistinctOutput(List<GridRecipe> alreadyAdded, GridRecipe candidate, IWorldAccessor world)
+        {
+            if (candidate == null) return false;
+            ItemStack candidateOutput = candidate.Output?.ResolvedItemStack;
+            // Unresolved/custom outputs cannot safely be declared duplicates. Keep them
+            // in native order rather than accidentally hiding a valid mod recipe.
+            if (candidateOutput?.Collectible == null) return true;
+            for (int i = 0; i < alreadyAdded.Count; i++)
+            {
+                ItemStack existingOutput = alreadyAdded[i]?.Output?.ResolvedItemStack;
+                if (existingOutput?.Collectible == null) continue;
+                try
+                {
+                    // IItemStack.Equals intentionally ignores StackSize, so quantity must
+                    // be compared explicitly before asking the game to compare attributes.
+                    if (existingOutput.StackSize != candidateOutput.StackSize) continue;
+                    ItemStack left = existingOutput.Clone();
+                    ItemStack right = candidateOutput.Clone();
+                    if (!left.Equals(world, right)) continue;
+                    string existingOutputAttributes = alreadyAdded[i]?.Output?.Attributes?.Token?.ToString() ?? string.Empty;
+                    string candidateOutputAttributes = candidate.Output?.Attributes?.Token?.ToString() ?? string.Empty;
+                    if (!string.Equals(existingOutputAttributes, candidateOutputAttributes, StringComparison.Ordinal)) continue;
+
+                    // A same-looking base output can still copy/merge different input
+                    // attributes or be modified by recipe attributes. Keep such recipes
+                    // selectable rather than collapsing their crafting semantics.
+                    GridRecipe existingRecipe = alreadyAdded[i];
+                    if (!string.Equals(existingRecipe?.CopyAttributesFrom, candidate.CopyAttributesFrom, StringComparison.Ordinal)) continue;
+                    if (!string.Equals(existingRecipe?.RequiresTrait, candidate.RequiresTrait, StringComparison.Ordinal)) continue;
+                    if (existingRecipe?.AverageDurability != candidate.AverageDurability) continue;
+                    string existingMerge = string.Join("\u001f", existingRecipe?.MergeAttributesFrom ?? Array.Empty<string>());
+                    string candidateMerge = string.Join("\u001f", candidate.MergeAttributesFrom ?? Array.Empty<string>());
+                    if (!string.Equals(existingMerge, candidateMerge, StringComparison.Ordinal)) continue;
+                    string existingAttributes = existingRecipe?.Attributes?.Token?.ToString() ?? string.Empty;
+                    string candidateAttributes = candidate.Attributes?.Token?.ToString() ?? string.Empty;
+                    if (!string.Equals(existingAttributes, candidateAttributes, StringComparison.Ordinal)) continue;
+                    return false;
+                }
+                catch
+                {
+                    // Si la equivalencia no se puede demostrar (por ejemplo, un
+                    // ItemStack personalizado de un mod), conservar la alternativa.
+                }
+            }
+            return true;
+        }
+
+        static string BuildGridCompositionKey(ItemSlot[] slots)
+        {
+            if (slots == null) return string.Empty;
+            var key = new StringBuilder(slots.Length * 6);
+            for (int i = 0; i < slots.Length; i++)
+            {
+                ItemStack stack = slots[i]?.Itemstack;
+                int id = stack?.Collectible != null && stack.StackSize > 0
+                    ? CraftCatalog.Pack(stack.Collectible)
+                    : 0;
+                key.Append(id).Append(';');
+            }
+            return key.ToString();
+        }
+
+        static bool TryReadGrid(
+            InventoryBase inventory,
+            out ItemSlot[] slots,
+            out HashSet<int> filledIds,
+            out int filled,
+            out int gridWidth,
+            out string gridKey)
+        {
+            slots = null;
+            filledIds = new HashSet<int>();
+            filled = 0;
+            gridWidth = 0;
+            gridKey = null;
+            if (inventory == null || inventory.Count < 2) return false;
+
+            int slotCount = inventory.Count - 1;
+            gridWidth = (int)Math.Sqrt(slotCount);
+            if (gridWidth * gridWidth != slotCount) return false;
+
+            slots = new ItemSlot[slotCount];
+            var keySb = new StringBuilder(slotCount * 10);
+            for (int i = 0; i < slotCount; i++)
+            {
+                ItemSlot slot = inventory[i];
+                slots[i] = slot;
+                ItemStack stack = slot?.Itemstack;
+                if (stack?.Collectible != null && stack.StackSize > 0)
+                {
+                    int id = CraftCatalog.Pack(stack.Collectible);
+                    filledIds.Add(id);
+                    filled++;
+                    // StackSize + la firma local de los atributos invalida estados antiguos.
+                    keySb.Append(id).Append('x').Append(stack.StackSize).Append('#')
+                         .Append(stack.GetHashCode()).Append('#')
+                         .Append(stack.Attributes?.GetHashCode() ?? 0).Append(';');
+                }
+                else keySb.Append("0;");
+            }
+            gridKey = keySb.ToString();
+            return true;
+        }
+
+        sealed class RecipeIdentityCacheEntry
+        {
+            public string Value;
+        }
+
+        static readonly ConditionalWeakTable<GridRecipe, RecipeIdentityCacheEntry> RecipeIdentityCache =
+            new ConditionalWeakTable<GridRecipe, RecipeIdentityCacheEntry>();
+
+        public static string RecipeIdentity(GridRecipe recipe)
+        {
+            if (recipe == null) return string.Empty;
+            try
+            {
+                return RecipeIdentityCache.GetValue(recipe, BuildRecipeIdentity).Value ?? string.Empty;
+            }
+            catch
+            {
+                // A partial identity could collide across mod recipes. Returning no key
+                // deliberately disables the carousel for this matching grid rather than
+                // sending a recipe identifier that the server might resolve ambiguously.
+                return string.Empty;
+            }
+        }
+
+        static RecipeIdentityCacheEntry BuildRecipeIdentity(GridRecipe recipe)
+        {
+            ItemStack output = recipe.Output?.ResolvedItemStack;
+            string outputCode = output?.Collectible?.Code?.ToString()
+                ?? recipe.Output?.Code?.ToString() ?? string.Empty;
+            string outputClass = output?.Class.ToString() ?? string.Empty;
+            int outputQuantity = output?.StackSize ?? recipe.Output?.StackSize ?? 0;
+
+            // The network key must be deterministic between client and server. Do not use
+            // ItemStack.ToBytes(): its numeric collectible IDs are runtime registry values.
+            // Recipe asset name + code + quantity + stable JSON/recipe fields distinguish
+            // normal asset recipes as well as output variants with different attributes.
+            string outputAttributes = string.Empty;
+            string recipeAttributes = string.Empty;
+            try { outputAttributes = recipe.Output?.Attributes?.Token?.ToString() ?? string.Empty; } catch { }
+            try { recipeAttributes = recipe.Attributes?.Token?.ToString() ?? string.Empty; } catch { }
+
+            StringBuilder properties = new StringBuilder(160);
+            AppendIdentityField(properties, outputAttributes);
+            AppendIdentityField(properties, recipe.Width.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            AppendIdentityField(properties, recipe.Height.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            AppendIdentityField(properties, recipe.Shapeless ? "1" : "0");
+            AppendIdentityField(properties, recipe.RecipeGroup.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            AppendIdentityField(properties, recipe.RequiresTrait ?? string.Empty);
+            AppendIdentityField(properties, recipe.CopyAttributesFrom ?? string.Empty);
+            AppendIdentityField(properties, recipe.AverageDurability ? "1" : "0");
+            AppendIdentityField(properties, string.Join("\u001f", recipe.MergeAttributesFrom ?? Array.Empty<string>()));
+            AppendIdentityField(properties, recipeAttributes);
+
+            StringBuilder key = new StringBuilder(144);
+            AppendIdentityField(key, recipe.Name?.ToShortString() ?? string.Empty);
+            AppendIdentityField(key, outputCode);
+            AppendIdentityField(key, outputClass);
+            AppendIdentityField(key, outputQuantity.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            AppendIdentityField(key, HashText(properties.ToString()));
+            return new RecipeIdentityCacheEntry { Value = key.ToString() };
+        }
+
+        static void AppendIdentityField(StringBuilder builder, string value)
+        {
+            value = value ?? string.Empty;
+            builder.Append(value.Length.ToString(System.Globalization.CultureInfo.InvariantCulture))
+                .Append(':').Append(value).Append(';');
+        }
+
+        static string HashText(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return string.Empty;
+            // A compact deterministic string signature; no registry IDs or object hashes.
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+                return BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(value))).Replace("-", string.Empty);
+        }
+
+        /// <summary>
+        /// Client-side, low-frequency carousel update. It changes the real native
+        /// matching recipe (not just a drawn icon), and sends that choice to the server.
+        /// </summary>
+        public static void ClientCarouselTick(float dt)
+        {
+            try
+            {
+                ICoreClientAPI api = HandbookOptMod.Capi;
+                IPlayer player = api?.World?.Player;
+                IInventory ownGrid = player?.InventoryManager?.GetOwnInventory("craftinggrid");
+                InventoryBase inventory = ownGrid as InventoryBase;
+                if (api == null || player == null || inventory == null) return;
+                // A cosmetic carousel without a working client channel could show one
+                // recipe while the server crafts another. Fail closed instead.
+                if (!HandbookOptMod.RecipeVariantClientChannelAvailable) return;
+                if (!HandbookOptMod.GridStates.TryGetValue(inventory, out HandbookOptMod.GridSearchState state) || state == null)
+                    return;
+                List<GridRecipe> variants = state.MatchingRecipes;
+                if (variants == null || variants.Count < 2 || state.Previous == null)
+                {
+                    state.NextVariantAt = 0;
+                    state.LastCarouselTickAt = api.ElapsedMilliseconds;
+                    return;
+                }
+                if (!TryReadGrid(inventory, out ItemSlot[] slots, out _, out int filled, out int gridWidth, out string gridKey)) return;
+
+                GridRecipeIndex index = HandbookOptMod.ClientGridIndex;
+                if (index == null || !index.IsReady || !ReferenceEquals(index.World, api.World)
+                    || !ReferenceEquals(state.Index, index) || state.GridKey != gridKey)
+                {
+                    state.LastCarouselTickAt = api.ElapsedMilliseconds;
+                    state.NextVariantAt = 0;
+                    return;
+                }
+
+                long now = api.ElapsedMilliseconds;
+                long elapsed = state.LastCarouselTickAt > 0 ? Math.Max(0, now - state.LastCarouselTickAt) : 0;
+                state.LastCarouselTickAt = now;
+
+                if (filled <= 0 || variants.Count < 2 || state.Previous == null)
+                {
+                    state.NextVariantAt = 0;
+                    return;
+                }
+
+                if (!state.Previous.Enabled)
+                {
+                    state.NextVariantAt = 0;
+                    return;
+                }
+
+                if (!IsInventoryDialogOpen(api))
+                {
+                    // Hidden inventory: hold the carousel rather than cycling a hidden
+                    // output slot; opening it restarts the 2-second delay.
+                    state.NextVariantAt = now + 2000;
+                    return;
+                }
+
+                bool hoveringOutput = IsMouseOverCraftingOutput(api, inventory);
+                if (hoveringOutput)
+                {
+                    // Freeze the remaining delay while hovered, then continue it on leave.
+                    if (state.NextVariantAt > 0) state.NextVariantAt += elapsed;
+                    return;
+                }
+
+                if (state.NextVariantAt <= 0) state.NextVariantAt = now + 2000;
+                if (now < state.NextVariantAt) return;
+
+                int currentIndex = state.ActiveRecipeIndex;
+                if (currentIndex < 0 || currentIndex >= variants.Count || !ReferenceEquals(variants[currentIndex], state.Previous))
+                {
+                    currentIndex = variants.IndexOf(state.Previous);
+                    if (currentIndex < 0) currentIndex = 0;
+                }
+
+                for (int offset = 1; offset <= variants.Count; offset++)
+                {
+                    int nextIndex = (currentIndex + offset) % variants.Count;
+                    GridRecipe next = variants[nextIndex];
+                    if (next == null || !next.Enabled || !next.Matches(player, api.World, slots, gridWidth)) continue;
+                    if (!InvokeNativeFoundMatch(inventory, next)) continue;
+
+                    state.Previous = next;
+                    state.GridKey = gridKey;
+                    state.ActiveRecipeIndex = nextIndex;
+                    state.NextVariantAt = now + 2000;
+                    HandbookOptMod.SendRecipeVariantSelection(next);
+                    return;
+                }
+
+                // Do not keep displaying an output whose custom Matches rule expired.
+                // Validation happens only at a carousel boundary, not every 100 ms.
+                if (!state.Previous.Enabled || !state.Previous.Matches(player, api.World, slots, gridWidth))
+                {
+                    ItemSlot outputSlot = inventory[inventory.Count - 1];
+                    ClearNativeMatchState(inventory, outputSlot);
+                    ClearRecipeMatches(state, gridKey);
+                    return;
+                }
+                state.NextVariantAt = now + 2000;
+            }
+            catch (Exception e)
+            {
+                try { HandbookOptMod.Capi?.Logger?.Debug("[HandbookOpt] Se omitió un paso del carrusel de recetas: {0}", e.Message); } catch { }
+            }
+        }
+
+        static bool IsInventoryDialogOpen(ICoreClientAPI api)
+        {
+            try
+            {
+                var opened = api?.Gui?.OpenedGuis;
+                if (opened == null) return false;
+                for (int i = 0; i < opened.Count; i++)
+                {
+                    GuiDialog dialog = opened[i];
+                    if (dialog == null || !dialog.IsOpened()) continue;
+                    if (string.Equals(dialog.ToggleKeyCombinationCode, "inventory", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(dialog.GetType().Name, "GuiDialogInventory", StringComparison.Ordinal)) return true;
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        static bool IsMouseOverCraftingOutput(ICoreClientAPI api, IInventory craftInventory)
+        {
+            try
+            {
+                var opened = api?.Gui?.OpenedGuis;
+                if (opened == null) return false;
+                for (int i = 0; i < opened.Count; i++)
+                {
+                    GuiDialog dialog = opened[i];
+                    if (dialog == null || !dialog.IsOpened()) continue;
+                    if (!string.Equals(dialog.ToggleKeyCombinationCode, "inventory", StringComparison.OrdinalIgnoreCase)
+                        && !string.Equals(dialog.GetType().Name, "GuiDialogInventory", StringComparison.Ordinal)) continue;
+
+                    GuiComposer composer = dialog.SingleComposer;
+                    if (composer == null) continue;
+                    FieldInfo[] fields = composer.GetType().GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    for (int f = 0; f < fields.Length; f++)
+                    {
+                        object value;
+                        try { value = fields[f].GetValue(composer); }
+                        catch { continue; }
+                        if (ContainsHoveredOutputGrid(value, craftInventory, new HashSet<object>(), 0)) return true;
+                    }
+
+                    // Common inventory element keys as a fallback for game UI revisions.
+                    string[] keys = { "craftinggrid", "craftingGrid", "craftingGridSlots", "craftinggrid-slots" };
+                    for (int k = 0; k < keys.Length; k++)
+                    {
+                        try
+                        {
+                            GuiElementItemSlotGridBase grid = composer.GetElement(keys[k]) as GuiElementItemSlotGridBase;
+                            if (IsHoveredOutputGrid(grid, craftInventory)) return true;
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        static bool ContainsHoveredOutputGrid(object value, IInventory craftInventory, HashSet<object> visited, int depth)
+        {
+            if (value == null || depth > 2) return false;
+            if (value is GuiElementItemSlotGridBase grid) return IsHoveredOutputGrid(grid, craftInventory);
+            if (value is string || value.GetType().IsPrimitive) return false;
+            if (!value.GetType().IsValueType && !visited.Add(value)) return false;
+
+            if (value is IDictionary dictionary)
+            {
+                foreach (DictionaryEntry entry in dictionary)
+                    if (ContainsHoveredOutputGrid(entry.Value, craftInventory, visited, depth + 1)) return true;
+                return false;
+            }
+            if (value is IEnumerable enumerable)
+            {
+                foreach (object entry in enumerable)
+                    if (ContainsHoveredOutputGrid(entry, craftInventory, visited, depth + 1)) return true;
+            }
+            return false;
+        }
+
+        static bool IsHoveredOutputGrid(GuiElementItemSlotGridBase grid, IInventory craftInventory)
+        {
+            return grid != null && ReferenceEquals(grid.hoverInv, craftInventory)
+                && grid.hoverSlotId == craftInventory.Count - 1;
+        }
+
+        /// <summary>
+        /// Apply the selected catalog variant to the real client crafting grid after its
+        /// ingredients have been transferred. This suppresses output-slot animation while
+        /// keeping the displayed result tied to the selected recipe.
+        /// </summary>
+        public static bool ApplyClientRecipeSelection(GridRecipe recipe)
+        {
+            try
+            {
+                ICoreClientAPI api = HandbookOptMod.Capi;
+                IPlayer player = api?.World?.Player;
+                InventoryBase inventory = player?.InventoryManager?.GetOwnInventory("craftinggrid") as InventoryBase;
+                if (api == null || player == null || inventory == null || recipe == null || !recipe.Enabled) return false;
+                if (!TryReadGrid(inventory, out ItemSlot[] slots, out _, out int filled, out int gridWidth, out string gridKey) || filled == 0)
+                    return false;
+                if (!recipe.Matches(player, api.World, slots, gridWidth)) return false;
+                if (!InvokeNativeFoundMatch(inventory, recipe)) return false;
+
+                GridRecipeIndex index = HandbookOptMod.ClientGridIndex;
+                HandbookOptMod.GridSearchState state = HandbookOptMod.GridStates.GetValue(inventory, _ => new HandbookOptMod.GridSearchState());
+                state.Index = index;
+                state.Previous = recipe;
+                state.GridKey = gridKey;
+                state.GridCompositionKey = BuildGridCompositionKey(slots);
+                state.MatchingRecipes = null; // output-slot carousel intentionally disabled
+                state.ActiveRecipeIndex = -1;
+                state.NextVariantAt = 0;
+                state.LastCarouselTickAt = api.ElapsedMilliseconds;
+                state.ExplicitServerSelection = false;
+                HandbookOptMod.SendRecipeVariantSelection(recipe);
+                return true;
+            }
+            catch (Exception e)
+            {
+                try { HandbookOptMod.Capi?.Logger?.Debug("[HandbookOpt] No se pudo fijar la receta seleccionada en la cuadrícula cliente: {0}", e.Message); } catch { }
+                return false;
+            }
+        }
+
+        public static void ApplyServerRecipeSelection(IPlayer player, string recipeKey)
+        {
+            try
+            {
+                ICoreServerAPI api = HandbookOptMod.ServerApi;
+                IWorldAccessor world = api?.World;
+                InventoryBase inventory = player?.InventoryManager?.GetOwnInventory("craftinggrid") as InventoryBase;
+                if (api == null || world?.GridRecipes == null || player == null || inventory == null) return;
+                GridRecipeIndex index = HandbookOptMod.ServerGridIndex;
+                bool indexUsable = index != null && index.IsReady && ReferenceEquals(index.World, world)
+                    && world.GridRecipes.Count == index.SourceRecipeCount;
+
+                if (!TryReadGrid(inventory, out ItemSlot[] slots, out HashSet<int> filledIds, out int filled, out int gridWidth, out string gridKey) || filled == 0)
+                    return;
+
+                GridRecipe selected = null;
+                if (indexUsable && index.DuplicateRecipesByIdentity.TryGetValue(recipeKey, out List<GridRecipe> matchingKeys))
+                {
+                    for (int i = 0; i < matchingKeys.Count; i++)
+                    {
+                        GridRecipe recipe = matchingKeys[i];
+                        if (recipe == null || !recipe.Enabled) continue;
+                        if (!HasAllExactIngredientsPresent(recipe, filledIds, gridWidth)) continue;
+                        if (!recipe.Matches(player, world, slots, gridWidth)) continue;
+                        selected = recipe;
+                        break;
+                    }
+                }
+                else if (indexUsable && index.RecipeByIdentity.TryGetValue(recipeKey, out GridRecipe singleRecipe)
+                    && singleRecipe != null && singleRecipe.Enabled
+                    && HasAllExactIngredientsPresent(singleRecipe, filledIds, gridWidth)
+                    && singleRecipe.Matches(player, world, slots, gridWidth))
+                {
+                    selected = singleRecipe;
+                }
+                else if (!indexUsable)
+                {
+                    // Rare startup/rebuild fallback only: the optimized index is not ready,
+                    // so resolve the requested key against the live server recipe list. The
+                    // normal carousel path uses the precomputed maps above.
+                    for (int i = 0; i < world.GridRecipes.Count; i++)
+                    {
+                        GridRecipe recipe = world.GridRecipes[i];
+                        if (recipe == null || !recipe.Enabled) continue;
+                        if (!string.Equals(RecipeIdentity(recipe), recipeKey, StringComparison.Ordinal)) continue;
+                        if (!HasAllExactIngredientsPresent(recipe, filledIds, gridWidth)) continue;
+                        if (!recipe.Matches(player, world, slots, gridWidth)) continue;
+                        selected = recipe;
+                        break;
+                    }
+                }
+                if (selected == null) return;
+
+                object inventoryKey = inventory;
+                HandbookOptMod.GridSearchState state = HandbookOptMod.GridStates.GetValue(inventoryKey, _ => new HandbookOptMod.GridSearchState());
+                state.Index = index;
+                state.Previous = selected;
+                state.GridKey = gridKey;
+                state.GridCompositionKey = BuildGridCompositionKey(slots);
+                state.ExplicitServerSelection = true;
+                if (state.MatchingRecipes != null)
+                {
+                    int selectedIndex = state.MatchingRecipes.FindIndex(r => string.Equals(RecipeIdentity(r), recipeKey, StringComparison.Ordinal));
+                    state.ActiveRecipeIndex = selectedIndex;
+                }
+                // This is a validated request from the owner of the inventory. The result
+                // is recalculated through the native method, never copied from the client.
+                if (!InvokeNativeFoundMatch(inventory, selected))
+                {
+                    state.Previous = null;
+                    state.ActiveRecipeIndex = -1;
+                    state.ExplicitServerSelection = false;
+                    return;
+                }
+                try { api.Logger.Debug("[HandbookOpt] Aceptada selección de receta alternativa {0} para {1}.", recipeKey, player.PlayerName); }
+                catch { }
+            }
+            catch (Exception e)
+            {
+                try { HandbookOptMod.ServerApi?.Logger?.Debug("[HandbookOpt] No se pudo aplicar la selección alternativa en el servidor: {0}", e.Message); } catch { }
+            }
+        }
+
+        static bool ContainsRecipeReference(IList<GridRecipe> recipes, GridRecipe target)
+        {
+            if (recipes == null || target == null) return false;
+            for (int i = 0; i < recipes.Count; i++)
+                if (ReferenceEquals(recipes[i], target)) return true;
+            return false;
         }
 
         static bool TryResolveContext(InventoryBase inventory, out IPlayer player, out IWorldAccessor world, out GridRecipeIndex index)
@@ -1092,6 +1753,39 @@ namespace HandbookOpt
                 outputSlot.Itemstack = null;
                 outputSlot.MarkDirty();
             }
+        }
+    }
+
+    /// <summary>
+    /// Sends the current carousel choice before the normal inventory click is processed.
+    /// This reduces the chance of the server crafting the previous variant if the player
+    /// clicks immediately after the displayed result changes.
+    /// </summary>
+    [HarmonyPatch]
+    public static class CraftingOutputVariantClickPatch
+    {
+        static MethodBase TargetMethod()
+        {
+            return AccessTools.Method(typeof(GuiElementItemSlotGridBase), nameof(GuiElementItemSlotGridBase.OnMouseDownOnElement),
+                new[] { typeof(ICoreClientAPI), typeof(MouseEvent) });
+        }
+
+        static bool Prepare() => TargetMethod() != null;
+
+        [HarmonyPrefix]
+        [HarmonyPriority(Priority.First)]
+        public static void Prefix(GuiElementItemSlotGridBase __instance)
+        {
+            try
+            {
+                ICoreClientAPI api = HandbookOptMod.Capi;
+                IInventory expectedGrid = api?.World?.Player?.InventoryManager?.GetOwnInventory("craftinggrid");
+                if (__instance == null || expectedGrid == null) return;
+                if (!ReferenceEquals(__instance.hoverInv, expectedGrid) || __instance.hoverSlotId != expectedGrid.Count - 1) return;
+                if (!HandbookOptMod.GridStates.TryGetValue(expectedGrid, out HandbookOptMod.GridSearchState state) || state?.Previous == null) return;
+                HandbookOptMod.SendRecipeVariantSelection(state.Previous);
+            }
+            catch { /* A failed hint must never cancel the native inventory click. */ }
         }
     }
 }

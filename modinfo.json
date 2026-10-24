@@ -5,8 +5,8 @@
   "authors": [
     "Nilsson"
   ],
-  "description": "Enhances crafting and handbook usability with a searchable, paginated recipe browser, one-click crafting grid filling, bulk ingredient transfer, compact ingredient tooltips with grouped quantities and rotating variant previews, and a searchable mod guide browser. Preserves the vanilla Handbook and supports recipes from both vanilla and mods.",
-  "version": "1.5.1",
+  "description": "Improves Handbook search and recipe browsing, and optimizes crafting-grid recipe matching for Vintage Story 1.22.7. Includes a searchable recipe panel, bulk ingredient transfer, and alternate recipe-output selection. The craft catalog and vanilla Handbook search index are kept in memory; persistent disk-cache code is included. Craft-catalog indexing starts at LevelFinalize and processes up to 700 recipes per client tick.",
+  "version": "1.5.8",
   "side": "Universal",
   "dependencies": {
     "game": "1.22.7"

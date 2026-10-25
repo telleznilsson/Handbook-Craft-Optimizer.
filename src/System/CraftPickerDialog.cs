@@ -502,6 +502,8 @@ namespace HandbookOpt
             const int VariantSlideIntervalMs = 1000;
             const int MaxVisibleIngredientRows = 9;
             const int MaxSampleVariants = 16;
+            // Profundidad del fondo del tooltip (sin cambios respecto a la versión anterior).
+            const float TooltipBackgroundZ = 1000f;
             const int MaxSampleCacheEntries = 128;
             // Evita recorrer decenas de miles de objetos en el hilo de render si una receta
             // solo define etiquetas y no tiene code. Los casos con code usan SearchItems/Blocks.
@@ -672,7 +674,19 @@ namespace HandbookOpt
                 x = Math.Max(2, Math.Min(x, screenWidth - textureWidth - 2));
                 y = Math.Max(2, Math.Min(y, screenHeight - textureHeight - 2));
 
-                client.Render.Render2DTexturePremultipliedAlpha(texture.TextureId, x, y, textureWidth, textureHeight, 1000f);
+                client.Render.Render2DTexturePremultipliedAlpha(texture.TextureId, x, y, textureWidth, textureHeight, TooltipBackgroundZ);
+
+                // RenderItemstackToGui dibuja un modelo 3D escalado a "size" en todos los ejes,
+                // no un sprite plano. Su profundidad se extiende unos +/-size/2 alrededor de posZ.
+                // Con el icono a solo 1 unidad del fondo (z 1001 vs 1000), parte del modelo queda
+                // DETRÁS del fondo y falla la prueba de profundidad. En objetos finos con una
+                // transformación GUI que gira o invierte el eje Z, las caras texturizadas son las
+                // ocultas y solo se ven las traseras sin textura: una silueta negra.
+                // El tooltip vanilla (GuiElementItemstackInfo) evita esto situando el icono
+                // 1000 + 2*tamaño por encima: todo el volumen queda delante del fondo.
+                // Solo se SUBE el icono; el fondo conserva 1000, así que ninguna otra parte
+                // de la interfaz cambia de orden.
+                double iconZ = TooltipBackgroundZ + Math.Max(2.0, iconSize * 2.0);
 
                 // Los iconos se dibujan a partir de muestras ya resueltas/cachéadas.
                 // Solo se crean DummySlot al cambiar de diapositiva, nunca por fotograma.
@@ -685,7 +699,7 @@ namespace HandbookOpt
                     try
                     {
                         client.Render.RenderItemstackToGui(row.Slot, iconX + iconSize * 0.5, iconY + iconSize * 0.5,
-                            1001, iconSize, ColorUtil.WhiteArgb, true, false, false);
+                            iconZ, iconSize, ColorUtil.WhiteArgb, true, false, false);
                     }
                     catch { /* una pila sin modelo válido no debe ocultar el resto del tooltip */ }
                 }

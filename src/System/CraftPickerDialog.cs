@@ -518,6 +518,9 @@ namespace HandbookOpt
                 public string CodeText;
                 public int Quantity;
                 public int SampleIndex;
+                public int OwnedCount;
+                public int MissingCount;
+                public bool ShowAvailability;
                 public bool IsPattern;
                 public bool ReusableTool;
                 public bool HasIcon;
@@ -541,6 +544,8 @@ namespace HandbookOpt
             bool visible;
             bool composed;
             bool hasVariantSlides;
+            Dictionary<int, int> ownedCounts = new Dictionary<int, int>();
+            int possibleBatches;
             long hoverStartedAtMs;
             int currentSlideStep = -1;
             int textureWidth;
@@ -558,20 +563,38 @@ namespace HandbookOpt
                 texture = new LoadedTexture(capi);
             }
 
-            public void SetRecipe(CompactRecipe nextRecipe, int nextRecipeIndex, bool canCraft)
+            public void SetRecipe(CompactRecipe nextRecipe, int nextRecipeIndex, bool canCraft,
+                Dictionary<int, int> availableItems, int batchesAvailable)
             {
-                if (visible && ReferenceEquals(recipe, nextRecipe) && recipeIndex == nextRecipeIndex && craftable == canCraft)
+                bool countsUnchanged = DictionariesEqual(ownedCounts, availableItems);
+                if (visible && ReferenceEquals(recipe, nextRecipe) && recipeIndex == nextRecipeIndex
+                    && craftable == canCraft && possibleBatches == batchesAvailable && countsUnchanged)
                     return;
 
                 recipe = nextRecipe;
                 recipeIndex = nextRecipeIndex;
                 craftable = canCraft;
+                possibleBatches = Math.Max(0, batchesAvailable);
+                ownedCounts = availableItems != null
+                    ? new Dictionary<int, int>(availableItems)
+                    : new Dictionary<int, int>();
                 visible = nextRecipe != null;
                 composed = false;
                 hasVariantSlides = false;
                 currentSlideStep = -1;
                 rows.Clear();
                 hoverStartedAtMs = Environment.TickCount64;
+            }
+
+            static bool DictionariesEqual(Dictionary<int, int> left, Dictionary<int, int> right)
+            {
+                if (ReferenceEquals(left, right)) return true;
+                if (left == null || right == null || left.Count != right.Count) return false;
+                foreach (var entry in left)
+                {
+                    if (!right.TryGetValue(entry.Key, out int value) || value != entry.Value) return false;
+                }
+                return true;
             }
 
             public void Clear()
@@ -705,6 +728,7 @@ namespace HandbookOpt
                     });
                 }
 
+                bool showExactAvailability = CanShowExactAvailability(groupedIngredients);
                 int groupedCount = groupedIngredients.Count;
                 int normalRows = groupedCount > MaxVisibleIngredientRows
                     ? MaxVisibleIngredientRows - 1
@@ -725,12 +749,27 @@ namespace HandbookOpt
                     var samples = ResolveSampleStacks(ingredient);
                     if (samples.Count > 1) hasVariantSlides = true;
 
+                    int ownedCount = 0;
+                    bool showAvailability = showExactAvailability;
+                    if (showAvailability)
+                    {
+                        try
+                        {
+                            int packedId = CraftCatalog.Pack(ingredient.ResolvedItemStack.Collectible);
+                            ownedCounts.TryGetValue(packedId, out ownedCount);
+                        }
+                        catch { showAvailability = false; }
+                    }
+
                     rows.Add(new TooltipRow
                     {
                         Ingredient = ingredient,
                         Samples = samples,
                         CodeText = SafeCodeText(ingredient),
                         Quantity = entry.TotalQuantity,
+                        OwnedCount = ownedCount,
+                        MissingCount = showAvailability ? Math.Max(0, entry.TotalQuantity - ownedCount) : 0,
+                        ShowAvailability = showAvailability,
                         IsPattern = isPattern,
                         ReusableTool = !ingredient.Consume,
                         MainText = string.Empty,
@@ -751,6 +790,36 @@ namespace HandbookOpt
                         HasIcon = false
                     });
                 }
+            }
+
+            bool CanShowExactAvailability(List<IngredientDisplayEntry> groupedIngredients)
+            {
+                // Per-ingredient deficits are shown only when the recipe is simple enough
+                // to allocate counts without overlap. Recipes with wildcard/tag rules still
+                // get the authoritative batch estimate in the footer.
+                try
+                {
+                    if (recipe?.Ings == null || recipe.Wild == null || recipe.Wild.Length != recipe.Ings.Length) return false;
+                    for (int i = 0; i < recipe.Ings.Length; i++)
+                    {
+                        CraftingRecipeIngredient ingredient = recipe.Ings[i];
+                        if (ingredient == null || ingredient.GetType() != typeof(CraftingRecipeIngredient)
+                            || ingredient.MatchingType != EnumRecipeMatchType.Exact || recipe.Wild[i]) return false;
+                        if (!ingredient.Tags.IsEmpty || ingredient.Attributes != null || ingredient.ReturnedStack != null) return false;
+                    }
+
+                    var seenIds = new HashSet<int>();
+                    for (int i = 0; i < groupedIngredients.Count; i++)
+                    {
+                        var ingredient = groupedIngredients[i]?.Ingredient;
+                        var collectible = ingredient?.ResolvedItemStack?.Collectible;
+                        if (collectible == null) return false;
+                        int id = CraftCatalog.Pack(collectible);
+                        if (!seenIds.Add(id)) return false;
+                    }
+                    return groupedIngredients.Count > 0;
+                }
+                catch { return false; }
             }
 
             static string IngredientDisplayGroupingKey(CraftingRecipeIngredient ingredient)
@@ -841,6 +910,10 @@ namespace HandbookOpt
                     row.MainText = FitText(label, 46);
                     row.QuantityText = "× " + row.Quantity.ToString(CultureInfo.InvariantCulture);
 
+                    if (row.ShowAvailability)
+                    {
+                        notes.Add(HandbookOptLang.Get("hover-tooltip-availability", row.OwnedCount, row.MissingCount));
+                    }
                     if (row.ReusableTool)
                     {
                         notes.Add(HandbookOptLang.Get("hover-tooltip-reusable-tool"));
@@ -1094,8 +1167,9 @@ namespace HandbookOpt
                 int statusY = titleY + Math.Max(17, (int)Math.Round(21 * scale));
                 int sectionY = statusY + Math.Max(17, (int)Math.Round(20 * scale));
                 rowTop = sectionY + Math.Max(19, (int)Math.Round(24 * scale));
-                textureHeight = rowTop + rows.Count * rowHeight + padding;
-                textureHeight = Math.Max(textureHeight, rowTop + (int)Math.Round(8 * scale));
+                int footerHeight = Math.Max(25, (int)Math.Round(29 * scale));
+                textureHeight = rowTop + rows.Count * rowHeight + footerHeight + padding;
+                textureHeight = Math.Max(textureHeight, rowTop + footerHeight + (int)Math.Round(8 * scale));
 
                 using (ImageSurface surface = new ImageSurface(Format.Argb32, textureWidth, textureHeight))
                 {
@@ -1189,12 +1263,33 @@ namespace HandbookOpt
                             {
                                 ctx.SelectFontFace("sans-serif", FontSlant.Normal, FontWeight.Normal);
                                 ctx.SetFontSize(smallFontSize);
-                                ctx.SetSourceRGBA(0.67, 0.72, 0.78, 1);
+                                if (row.ShowAvailability && row.MissingCount > 0)
+                                    ctx.SetSourceRGBA(1.0, 0.48, 0.43, 1);
+                                else if (row.ShowAvailability)
+                                    ctx.SetSourceRGBA(0.49, 0.91, 0.60, 1);
+                                else
+                                    ctx.SetSourceRGBA(0.67, 0.72, 0.78, 1);
                                 ctx.MoveTo(textX, rowY + Math.Max(27, (int)Math.Round(30 * scale)));
                                 ctx.ShowText(FitText(row.SecondaryText,
                                     Math.Max(12, (textureWidth - textX - padding) / Math.Max(5, smallFontSize / 2))));
                             }
                         }
+
+                        int footerY = rowTop + rows.Count * rowHeight + Math.Max(3, (int)Math.Round(4 * scale));
+                        ctx.SetSourceRGBA(0.34, 0.37, 0.41, 0.95);
+                        ctx.LineWidth = Math.Max(1, scale);
+                        ctx.MoveTo(padding, footerY);
+                        ctx.LineTo(textureWidth - padding, footerY);
+                        ctx.Stroke();
+                        ctx.SelectFontFace("sans-serif", FontSlant.Normal, FontWeight.Bold);
+                        ctx.SetFontSize(smallFontSize);
+                        if (possibleBatches > 0) ctx.SetSourceRGBA(0.49, 0.91, 0.60, 1);
+                        else ctx.SetSourceRGBA(1.0, 0.58, 0.48, 1);
+                        string batchSummary = possibleBatches > 0
+                            ? HandbookOptLang.Get("hover-tooltip-batches-available", possibleBatches)
+                            : HandbookOptLang.Get("hover-tooltip-batches-missing");
+                        ctx.MoveTo(padding, footerY + Math.Max(17, (int)Math.Round(21 * scale)));
+                        ctx.ShowText(FitText(batchSummary, Math.Max(18, (textureWidth - padding * 2) / Math.Max(5, smallFontSize / 2))));
                     }
 
                     // Reemplaza la textura anterior solo después de dibujar la nueva, y la libera
@@ -1257,8 +1352,21 @@ namespace HandbookOpt
         const string FilterAvailable = "__available";
         const string FilterAllMods = "__allmods";
         const string FilterVanilla = "__vanilla";
+        const string FilterRecent = "__recent";
+        const string FilterUsesIngredient = "__usesingredient";
+        const int MaxRecentRecipes = 12;
+        const string PickerPreferencesFilename = "handbookopt-picker-preferences.json";
+        readonly List<int> recentRecipeIndexes = new List<int>(MaxRecentRecipes);
+        ItemStack reverseSearchIngredient;
+        CraftPickerPreferences pickerPreferences;
+        bool preferencesLoaded;
+        bool preferencesCanWrite = true;
+        bool preferencesNeedValidation;
+        bool pendingIngredientPreferenceRestore;
+        bool preferencesSaveWarningLogged;
+        bool ingredientPickArmed;
         string selectedModFilter = FilterAvailable;
-        string[] modFilterValues = new[] { FilterAvailable, FilterAllMods };
+        string[] modFilterValues = new[] { FilterAvailable, FilterAllMods, FilterRecent };
         string[] modFilterNames = GetBaseModFilterNames();
         readonly Dictionary<string, HashSet<string>> modFilterDomains =
             new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
@@ -1320,7 +1428,178 @@ namespace HandbookOpt
         public CraftPickerDialog(ICoreClientAPI capi) : base(capi)
         {
             hoverTooltip = new RecipeIngredientTooltip(capi);
+            LoadPickerPreferences();
+            ApplySavedPickerPreferences();
             watchListener = capi.Event.RegisterGameTickListener(Watch, 200);
+        }
+
+        void LoadPickerPreferences()
+        {
+            try
+            {
+                pickerPreferences = capi.LoadModConfig<CraftPickerPreferences>(PickerPreferencesFilename);
+                preferencesLoaded = true;
+                preferencesCanWrite = true;
+                if (pickerPreferences == null)
+                {
+                    pickerPreferences = new CraftPickerPreferences();
+                    capi.StoreModConfig(pickerPreferences, PickerPreferencesFilename);
+                }
+            }
+            catch (Exception e)
+            {
+                // Never overwrite a preference file that could not be read: it may
+                // contain user data that should be recoverable after correcting it.
+                pickerPreferences = new CraftPickerPreferences();
+                preferencesLoaded = true;
+                preferencesCanWrite = false;
+                capi.Logger.Warning("[HandbookOpt] No se pudieron cargar las preferencias del selector; se usarán valores predeterminados sin sobrescribir el archivo: {0}", e.GetBaseException().Message);
+            }
+        }
+
+        static string NormalizePreferenceSearch(string value)
+        {
+            value = (value ?? string.Empty).Trim().ToLowerInvariant();
+            const int MaxSavedSearchLength = 256;
+            return value.Length <= MaxSavedSearchLength ? value : value.Substring(0, MaxSavedSearchLength);
+        }
+
+        void ApplySavedPickerPreferences()
+        {
+            if (!preferencesLoaded || pickerPreferences == null) return;
+
+            search = NormalizePreferenceSearch(pickerPreferences.Search);
+            page = Math.Max(0, pickerPreferences.Page);
+            selectedModFilter = string.IsNullOrWhiteSpace(pickerPreferences.SelectedFilter)
+                ? FilterAvailable
+                : pickerPreferences.SelectedFilter.Trim();
+            reverseSearchIngredient = null;
+            pendingIngredientPreferenceRestore = !string.IsNullOrWhiteSpace(pickerPreferences.ReverseIngredientData);
+            preferencesNeedValidation = true;
+            lastSig = string.Empty;
+            dirty = true;
+            dirtyAt = 0;
+        }
+
+        void TryRestoreIngredientPreference()
+        {
+            if (!pendingIngredientPreferenceRestore || capi?.World == null || pickerPreferences == null) return;
+
+            // Attempt this only once a world resolver exists. The saved ItemStack includes
+            // its attributes, so variant/tag-sensitive recipe matchers receive the same
+            // selected ingredient instead of a reconstructed item with lost attributes.
+            pendingIngredientPreferenceRestore = false;
+            try
+            {
+                string encoded = pickerPreferences.ReverseIngredientData;
+                if (string.IsNullOrWhiteSpace(encoded) || encoded.Length > 262144) return;
+                byte[] data = Convert.FromBase64String(encoded);
+                var restored = new ItemStack(data);
+                if (!restored.ResolveBlockOrItem(capi.World) || restored.Collectible == null) return;
+
+                string actualCode = restored.Collectible.Code?.ToString() ?? string.Empty;
+                string expectedCode = pickerPreferences.ReverseIngredientCode ?? string.Empty;
+                if (expectedCode.Length == 0 || !string.Equals(actualCode, expectedCode, StringComparison.OrdinalIgnoreCase))
+                    return;
+
+                reverseSearchIngredient = restored;
+                RefreshIngredientFilterOption();
+            }
+            catch
+            {
+                // A stale item, removed mod, or invalid preference must not prevent
+                // the dialog from opening; validation below falls back to a safe filter.
+            }
+        }
+
+        void ValidateRestoredPickerFilter()
+        {
+            if (!preferencesNeedValidation || !HandbookOptMod.IndexReady) return;
+            preferencesNeedValidation = false;
+
+            if (string.Equals(selectedModFilter, FilterRecent, StringComparison.OrdinalIgnoreCase)
+                && recentRecipeIndexes.Count == 0)
+            {
+                selectedModFilter = FilterAvailable;
+                page = 0;
+                SavePickerPreferences();
+                return;
+            }
+
+            if (string.Equals(selectedModFilter, FilterUsesIngredient, StringComparison.OrdinalIgnoreCase)
+                && reverseSearchIngredient?.Collectible == null)
+            {
+                selectedModFilter = FilterAvailable;
+                page = 0;
+                SavePickerPreferences();
+                return;
+            }
+
+            bool filterExists = false;
+            for (int i = 0; i < (modFilterValues?.Length ?? 0); i++)
+            {
+                if (string.Equals(modFilterValues[i], selectedModFilter, StringComparison.OrdinalIgnoreCase))
+                {
+                    filterExists = true;
+                    break;
+                }
+            }
+
+            if (!filterExists)
+            {
+                // Mod-specific filters can disappear when a mod is removed or renamed.
+                // Keep the user's search useful by opening the full catalog instead.
+                selectedModFilter = string.Equals(selectedModFilter, FilterAvailable, StringComparison.OrdinalIgnoreCase)
+                    ? FilterAvailable
+                    : FilterAllMods;
+                page = 0;
+                SavePickerPreferences();
+            }
+        }
+
+        void SavePickerPreferences()
+        {
+            if (!preferencesLoaded) return;
+            if (pickerPreferences == null) pickerPreferences = new CraftPickerPreferences();
+
+            pickerPreferences.Version = 1;
+            pickerPreferences.Search = NormalizePreferenceSearch(search);
+            pickerPreferences.SelectedFilter = string.IsNullOrWhiteSpace(selectedModFilter)
+                ? FilterAvailable
+                : selectedModFilter;
+            pickerPreferences.Page = Math.Max(0, page);
+
+            if (reverseSearchIngredient?.Collectible != null)
+            {
+                try
+                {
+                    pickerPreferences.ReverseIngredientData = Convert.ToBase64String(reverseSearchIngredient.ToBytes());
+                    pickerPreferences.ReverseIngredientCode = reverseSearchIngredient.Collectible.Code?.ToString() ?? string.Empty;
+                }
+                catch
+                {
+                    // Keep the last valid serialized ingredient if a custom stack fails serialization.
+                }
+            }
+            else if (!pendingIngredientPreferenceRestore)
+            {
+                pickerPreferences.ReverseIngredientData = string.Empty;
+                pickerPreferences.ReverseIngredientCode = string.Empty;
+            }
+
+            if (!preferencesCanWrite) return;
+            try
+            {
+                capi.StoreModConfig(pickerPreferences, PickerPreferencesFilename);
+            }
+            catch (Exception e)
+            {
+                if (!preferencesSaveWarningLogged)
+                {
+                    preferencesSaveWarningLogged = true;
+                    capi?.Logger?.Warning("[HandbookOpt] No se pudieron guardar las preferencias del selector: {0}", e.GetBaseException().Message);
+                }
+            }
         }
 
         // GuiElementDropDown dibuja la lista mediante un GuiElementListMenu separado.
@@ -1436,6 +1715,8 @@ namespace HandbookOpt
 
         public override void OnGuiClosed()
         {
+            SavePickerPreferences();
+            ingredientPickArmed = false;
             hoveredRecipeMatchIndex = -1;
             hoverTooltip?.Clear();
             base.OnGuiClosed();
@@ -1445,6 +1726,112 @@ namespace HandbookOpt
         void OnPauseGameToggled(bool value)
         {
             HandbookOptPauseController.SetEnabled(capi, value);
+        }
+
+        bool OnIngredientSearchButton()
+        {
+            ingredientPickArmed = !ingredientPickArmed;
+            if (ingredientPickArmed)
+            {
+                ClearHoveredRecipe();
+                try
+                {
+                    SingleComposer?.GetDynamicText("info")?.SetNewText(
+                        HandbookOptLang.Get("ingredient-search-pick-prompt"));
+                    capi?.Gui?.PlaySound("tick");
+                }
+                catch { }
+            }
+            else
+            {
+                try
+                {
+                    SingleComposer?.GetDynamicText("info")?.SetNewText(GetStatusInfoText());
+                    capi?.Gui?.PlaySound("tick");
+                }
+                catch { }
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Captures one left-click on a real player backpack/hotbar item while the
+        /// ingredient-search button is armed. Returning true tells the Harmony patch
+        /// to consume that click instead of moving or splitting the stack.
+        /// </summary>
+        public bool TryCaptureIngredientFromSlot(GuiElementItemSlotGridBase grid, MouseEvent args)
+        {
+            if (!ingredientPickArmed || grid == null || args == null || args.Button != EnumMouseButton.Left)
+                return false;
+
+            IPlayer player = capi?.World?.Player;
+            IInventory inventory = grid.hoverInv;
+            if (player == null || inventory == null) return false;
+
+            IInventory backpack = null;
+            IInventory hotbar = null;
+            try
+            {
+                backpack = player.InventoryManager?.GetOwnInventory("backpack");
+                hotbar = player.InventoryManager?.GetOwnInventory("hotbar");
+            }
+            catch { }
+
+            // Only capture from the player's own material storage. Never intercept clicks
+            // on chests, crafting outputs, equipment, or other mods' inventories.
+            if (!ReferenceEquals(inventory, backpack) && !ReferenceEquals(inventory, hotbar)) return false;
+
+            ItemSlot slot = null;
+            try
+            {
+                int slotId = grid.hoverSlotId;
+                if (slotId >= 0 && slotId < inventory.Count) slot = inventory[slotId];
+            }
+            catch { }
+
+            ItemStack stack = slot?.Itemstack;
+            if (stack?.Collectible == null || stack.StackSize <= 0) return false;
+
+            try { reverseSearchIngredient = stack.Clone(); }
+            catch { return false; }
+            ingredientPickArmed = false;
+            selectedModFilter = FilterUsesIngredient;
+            page = 0;
+            lastSig = string.Empty;
+            search = string.Empty;
+            try
+            {
+                settingSearch = true;
+                SingleComposer?.GetTextInput("search")?.SetValue(string.Empty);
+            }
+            catch { }
+            finally { settingSearch = false; }
+
+            RefreshIngredientFilterOption();
+            dirty = true;
+            dirtyAt = 0;
+            preferencesNeedValidation = false;
+            if (HandbookOptMod.IndexReady) RebuildMatches();
+            else ComposeAndOpen();
+            SavePickerPreferences();
+
+            try { capi?.Gui?.PlaySound("tick"); } catch { }
+            return true;
+        }
+
+        public bool IsIngredientPickArmed => ingredientPickArmed;
+
+        string ReverseSearchIngredientName()
+        {
+            if (reverseSearchIngredient == null) return string.Empty;
+            try
+            {
+                string name = reverseSearchIngredient.GetName();
+                if (!string.IsNullOrWhiteSpace(name)) return name;
+            }
+            catch { }
+            try { return reverseSearchIngredient.Collectible?.Code?.ToShortString() ?? string.Empty; }
+            catch { return string.Empty; }
         }
 
         public void SyncPauseSwitch()
@@ -1601,7 +1988,8 @@ namespace HandbookOpt
             return new[]
             {
                 HandbookOptLang.Get("filter-available"),
-                HandbookOptLang.Get("filter-all-mods")
+                HandbookOptLang.Get("filter-all-mods"),
+                HandbookOptLang.Get("filter-recent")
             };
         }
 
@@ -1609,6 +1997,9 @@ namespace HandbookOpt
         {
             lastPanelRecipeIndex = -1;
             lastSig = "";
+            recentRecipeIndexes.Clear();
+            reverseSearchIngredient = null;
+            ingredientPickArmed = false;
         }
 
         public void ClearTooltipSampleCache()
@@ -1625,6 +2016,8 @@ namespace HandbookOpt
             lastSig = string.Empty;
             dirty = true;
             dirtyAt = 0;
+            preferencesNeedValidation = false;
+            SavePickerPreferences();
             if (HandbookOptMod.IndexReady) RebuildMatches();
             else ComposeAndOpen();
         }
@@ -1633,11 +2026,17 @@ namespace HandbookOpt
         {
             modFilterOptionsBuilt = false;
             modFilterDomains.Clear();
-            modFilterValues = new[] { FilterAvailable, FilterAllMods };
+            modFilterValues = new[] { FilterAvailable, FilterAllMods, FilterRecent };
             modFilterNames = GetBaseModFilterNames();
             selectedModFilter = FilterAvailable;
+            reverseSearchIngredient = null;
+            pendingIngredientPreferenceRestore = false;
+            ingredientPickArmed = false;
             page = 0;
             lastSig = "";
+            // LeaveWorld clears world-specific history and item references, but the user's
+            // local picker preferences should be available again when another world loads.
+            ApplySavedPickerPreferences();
         }
 
         string BuildInventorySignature()
@@ -1898,12 +2297,17 @@ namespace HandbookOpt
             {
                 if (modFilterValues == null || modFilterValues.Length == 0)
                 {
-                    modFilterValues = new[] { FilterAvailable, FilterAllMods };
+                    modFilterValues = new[] { FilterAvailable, FilterAllMods, FilterRecent };
                     modFilterNames = GetBaseModFilterNames();
                 }
+                RefreshIngredientFilterOption();
                 return;
             }
-            if (modFilterOptionsBuilt) return;
+            if (modFilterOptionsBuilt)
+            {
+                RefreshIngredientFilterOption();
+                return;
+            }
 
             var loadedModNamesByNormalizedId = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             try
@@ -1986,7 +2390,7 @@ namespace HandbookOpt
             });
 
             modFilterDomains.Clear();
-            var values = new List<string> { FilterAvailable, FilterAllMods };
+            var values = new List<string> { FilterAvailable, FilterAllMods, FilterRecent };
             var names = new List<string>(GetBaseModFilterNames());
             for (int i = 0; i < entries.Count; i++)
             {
@@ -1999,7 +2403,31 @@ namespace HandbookOpt
             modFilterValues = values.ToArray();
             modFilterNames = names.ToArray();
             modFilterOptionsBuilt = true;
+            RefreshIngredientFilterOption();
+        }
 
+        void RefreshIngredientFilterOption()
+        {
+            var values = new List<string>();
+            var names = new List<string>();
+            int currentCount = Math.Min(modFilterValues?.Length ?? 0, modFilterNames?.Length ?? 0);
+            for (int i = 0; i < currentCount; i++)
+            {
+                if (string.Equals(modFilterValues[i], FilterUsesIngredient, StringComparison.OrdinalIgnoreCase)) continue;
+                values.Add(modFilterValues[i]);
+                names.Add(modFilterNames[i]);
+            }
+
+            if (reverseSearchIngredient?.Collectible != null)
+            {
+                values.Add(FilterUsesIngredient);
+                string itemName = ReverseSearchIngredientName();
+                string label = HandbookOptLang.Get("filter-uses-ingredient", itemName);
+                names.Add(CompactModFilterName(label));
+            }
+
+            modFilterValues = values.ToArray();
+            modFilterNames = names.ToArray();
         }
 
         int SelectedModFilterIndex()
@@ -2014,17 +2442,67 @@ namespace HandbookOpt
             if (!selected || string.IsNullOrWhiteSpace(code)) return;
 
             if (string.Equals(selectedModFilter, code, StringComparison.OrdinalIgnoreCase)) return;
+            ingredientPickArmed = false;
             selectedModFilter = code;
+            preferencesNeedValidation = false;
             page = 0;
             lastSig = "";
             dirty = true;
             dirtyAt = 0;
+            SavePickerPreferences();
             if (HandbookOptMod.IndexReady) RebuildMatches();
         }
 
         bool IsBrowsingRecipeCatalog()
         {
             return !string.Equals(selectedModFilter, FilterAvailable, StringComparison.OrdinalIgnoreCase);
+        }
+
+        bool IsBrowsingRecentRecipes()
+        {
+            return string.Equals(selectedModFilter, FilterRecent, StringComparison.OrdinalIgnoreCase);
+        }
+
+        bool IsBrowsingIngredientRecipes()
+        {
+            return string.Equals(selectedModFilter, FilterUsesIngredient, StringComparison.OrdinalIgnoreCase)
+                && reverseSearchIngredient?.Collectible != null;
+        }
+
+        static bool RecipeUsesIngredient(CompactRecipe recipe, ItemStack candidate)
+        {
+            if (recipe?.Ings == null || candidate?.Collectible == null) return false;
+            for (int i = 0; i < recipe.Ings.Length; i++)
+            {
+                CraftingRecipeIngredient ingredient = recipe.Ings[i];
+                if (ingredient == null) continue;
+                try
+                {
+                    // Use the recipe's own matcher, so tags, variants and custom ingredient
+                    // rules are respected instead of comparing display names or item codes.
+                    if (ingredient.SatisfiesAsIngredient(candidate, false)) return true;
+                }
+                catch
+                {
+                    // A custom matcher that cannot be evaluated is not treated as a match.
+                }
+            }
+            return false;
+        }
+
+        void RememberRecentRecipe(int recipeIndex)
+        {
+            if (recipeIndex < 0 || recipeIndex >= CraftCatalog.Recipes.Count) return;
+            recentRecipeIndexes.Remove(recipeIndex);
+            recentRecipeIndexes.Insert(0, recipeIndex);
+            if (recentRecipeIndexes.Count > MaxRecentRecipes)
+                recentRecipeIndexes.RemoveRange(MaxRecentRecipes, recentRecipeIndexes.Count - MaxRecentRecipes);
+
+            if (IsBrowsingRecentRecipes())
+            {
+                dirty = true;
+                dirtyAt = capi?.ElapsedMilliseconds ?? 0;
+            }
         }
 
         bool RecipePassesModFilter(CompactRecipe rec)
@@ -2051,9 +2529,44 @@ namespace HandbookOpt
             }
 
             EnsureModFilterOptions();
+            TryRestoreIngredientPreference();
+            RefreshIngredientFilterOption();
+            ValidateRestoredPickerFilter();
             var counts = CountOwned();
 
-            if (IsBrowsingRecipeCatalog())
+            if (IsBrowsingRecentRecipes())
+            {
+                // El historial conserva solo recetas realmente seleccionadas en esta sesión.
+                // No agrupar salidas ALT aquí: cada entrada reciente debe poder reabrirse tal cual.
+                for (int i = 0; i < recentRecipeIndexes.Count; i++)
+                {
+                    int idx = recentRecipeIndexes[i];
+                    if (idx < 0 || idx >= CraftCatalog.Recipes.Count) continue;
+                    CompactRecipe rec = CraftCatalog.Recipes[idx];
+                    if (!PassSearch(rec)) continue;
+                    matches.Add(idx);
+                    times.Add(-1);
+                }
+            }
+            else if (IsBrowsingIngredientRecipes())
+            {
+                // Completeness first: visit every recipe in the already-built catalogue and
+                // ask each ingredient's own matcher. Do not infer compatibility from IDs,
+                // MatchingType, Tags, or the concrete ingredient class; mods can implement
+                // matching rules that are not represented by those hints.
+                // This is an on-demand read-only query. It does not modify CraftCatalog,
+                // ByExactId, IndexGridRecipe(), recipe ordering, or any persistent index.
+                // A matcher that throws is skipped safely by RecipeUsesIngredient, rather
+                // than treating an unverified ingredient as a match.
+                for (int idx = 0; idx < CraftCatalog.Recipes.Count; idx++)
+                {
+                    CompactRecipe rec = CraftCatalog.Recipes[idx];
+                    if (!PassSearch(rec) || !RecipeUsesIngredient(rec, reverseSearchIngredient)) continue;
+                    matches.Add(idx);
+                    times.Add(-1);
+                }
+            }
+            else if (IsBrowsingRecipeCatalog())
             {
                 // En modo glosario, listar todas las recetas del dominio elegido,
                 // no solo las que pueden fabricarse con el inventario actual.
@@ -2125,10 +2638,26 @@ namespace HandbookOpt
                 }
             }
 
-            // Collapse only strict input-equivalent recipes with different outputs.
-            // Searches remain output-specific: if the user searches for one result, only
-            // matching outputs enter the group and no unrelated result is silently shown.
-            GroupMatchesIntoOutputVariants(previousVariantByInput);
+            // Historial: preservar cada receta seleccionada como una entrada independiente.
+            // En los demás filtros se mantiene el agrupamiento ALT existente.
+            if (IsBrowsingRecentRecipes())
+            {
+                matchVariantGroups.Clear();
+                for (int i = 0; i < matches.Count; i++)
+                {
+                    var group = new RecipeVariantDisplayGroup { InputKey = string.Empty };
+                    group.RecipeIndexes.Add(matches[i]);
+                    group.TimesByRecipe[matches[i]] = times[i];
+                    matchVariantGroups.Add(group);
+                }
+            }
+            else
+            {
+                // Collapse only strict input-equivalent recipes with different outputs.
+                // Searches remain output-specific: if the user searches for one result, only
+                // matching outputs enter the group and no unrelated result is silently shown.
+                GroupMatchesIntoOutputVariants(previousVariantByInput);
+            }
             // Reuse a matching existing static tile as the visual owner of an ALT group,
             // preferring a vanilla recipe entry when its output is represented. The old
             // detached ALT row is removed only after the group has a host, avoiding a
@@ -3127,12 +3656,14 @@ namespace HandbookOpt
 
             ElementBounds dialogBounds = ElementBounds.Fixed(x, y, dlgW, dlgH);
             ElementBounds bg = ElementBounds.Fill;
-            ElementBounds searchBounds = ElementBounds.Fixed(10, 38, 176, 28);
+            ElementBounds searchBounds = ElementBounds.Fixed(10, 38, 132, 28);
+            ElementBounds ingredientSearchButtonBounds = ElementBounds.Fixed(148, 38, 40, 28);
             // Recorte horizontal aplicado solo al desplegable de filtros/mods ("Todos los mods");
             // el tamaño del navegador y lector de guías no se modifica.
-            ElementBounds modFilterBounds = ElementBounds.Fixed(192, 38, Math.Min(148, dlgW - 202), 28);
+            ElementBounds modFilterBounds = ElementBounds.Fixed(197, 38, Math.Min(148, dlgW - 202), 28);
+            TryRestoreIngredientPreference();
             EnsureModFilterOptions();
-            ElementBounds gridBounds = ElementBounds.Fixed(10, 74 + pauseRow, gridW, gridH);
+            ElementBounds gridBounds = ElementBounds.Fixed((dlgW - gridW) / 2, 74 + pauseRow, gridW, gridH);
             ElementBounds inset = gridBounds.FlatCopy().FixedGrow(4).WithFixedOffset(-2, -2);
             ElementBounds prevB = ElementBounds.Fixed(10, 78 + pauseRow + gridH, 36, 26);
             ElementBounds nextB = ElementBounds.Fixed(dlgW - 46, 78 + pauseRow + gridH, 36, 26);
@@ -3236,9 +3767,11 @@ namespace HandbookOpt
 
             string info = GetStatusInfoText();
 
-            string hintText = catalogMode
-                ? HandbookOptLang.Get("recipe-catalog-hint")
-                : HandbookOptLang.Get("available-recipes-hint");
+            string hintText = IsBrowsingIngredientRecipes()
+                ? HandbookOptLang.Get("ingredient-search-hint", ReverseSearchIngredientName())
+                : catalogMode
+                    ? HandbookOptLang.Get("recipe-catalog-hint")
+                    : HandbookOptLang.Get("available-recipes-hint");
             string[] hintLines = (hintText ?? string.Empty).Split(new[] { '\n' }, 2);
             string hintFirstLine = hintLines.Length > 0 ? hintLines[0] : string.Empty;
             string hintLastLine = hintLines.Length > 1 ? hintLines[1] : string.Empty;
@@ -3248,6 +3781,7 @@ namespace HandbookOpt
                 .AddShadedDialogBG(bg, true)
                 .AddDialogTitleBar(HandbookOptLang.Get("recipe-panel-title"), OnTitleClose)
                 .AddTextInput(searchBounds, OnSearch, CairoFont.WhiteSmallText(), "search")
+                .AddSmallButton(HandbookOptLang.Get("ingredient-search-button"), OnIngredientSearchButton, ingredientSearchButtonBounds)
                 .AddDropDown(modFilterValues, modFilterNames, SelectedModFilterIndex(), OnModFilterChanged, modFilterBounds, "modfilter");
             if (showPause)
             {
@@ -3289,6 +3823,12 @@ namespace HandbookOpt
         {
             // Un compositor oculto puede seguir notificando hover cuando el popup del
             // filtro está abierto. No conservamos una receta activa en ese caso.
+            if (ingredientPickArmed)
+            {
+                ClearHoveredRecipe();
+                return;
+            }
+
             if (IsMouseOverModFilterPopup() || IsMouseCoveredByOtherDialog())
             {
                 ClearHoveredRecipe();
@@ -3315,7 +3855,10 @@ namespace HandbookOpt
             var rec = CraftCatalog.Recipes[matches[abs]];
             RecipeVariantDisplayGroup group = abs < matchVariantGroups.Count ? matchVariantGroups[abs] : null;
             bool canCraft = index >= 0 && index < shownCraftable.Count && shownCraftable[index];
-            hoverTooltip?.SetRecipe(rec, matches[abs], canCraft);
+            Dictionary<int, int> ownedCounts = CountOwned();
+            int possibleBatches = HowMany(rec, ownedCounts, true);
+            if (possibleBatches > 0) possibleBatches = Math.Min(possibleBatches, MaxFit(rec, possibleBatches));
+            hoverTooltip?.SetRecipe(rec, matches[abs], canCraft, ownedCounts, possibleBatches);
             try
             {
                 // En una entrada agrupada la línea secundaria muestra qué salida exacta
@@ -3327,6 +3870,7 @@ namespace HandbookOpt
 
         string GetStatusInfoText()
         {
+            if (ingredientPickArmed) return HandbookOptLang.Get("ingredient-search-pick-prompt");
             if (!HandbookOptMod.IndexReady)
             {
                 int pct = HandbookOptMod.IndexTotal <= 0
@@ -3337,6 +3881,9 @@ namespace HandbookOpt
 
             if (matches.Count == 0)
             {
+                if (IsBrowsingRecentRecipes()) return HandbookOptLang.Get("filter-no-recent-recipes");
+                if (IsBrowsingIngredientRecipes())
+                    return HandbookOptLang.Get("filter-no-recipes-use-ingredient", ReverseSearchIngredientName());
                 return IsBrowsingRecipeCatalog()
                     ? HandbookOptLang.Get("filter-no-grid-recipes")
                     : HandbookOptLang.Get("nothing-craftable");
@@ -3489,6 +4036,7 @@ namespace HandbookOpt
                 page--;
                 lastSig = "";
                 RebuildMatches();
+                SavePickerPreferences();
             }
             return true;
         }
@@ -3501,6 +4049,7 @@ namespace HandbookOpt
                 page++;
                 lastSig = "";
                 RebuildMatches();
+                SavePickerPreferences();
             }
             return true;
         }
@@ -3516,6 +4065,7 @@ namespace HandbookOpt
             // any items into the grid. Uses the same CharacterSystem trait check as
             // Vintage Story's recipe-matching events, including extraTraits.
             if (!CheckRequiredTrait(rec)) return;
+            RememberRecentRecipe(selectedRecipeIndex);
 
             bool fillAll = shiftPressedForCurrentGridClick;
             if (fillAll)
@@ -4425,6 +4975,7 @@ namespace HandbookOpt
 
         public override void Dispose()
         {
+            SavePickerPreferences();
             DetachInventoryLifecycleHooks();
             inventoryCloseSuppressedUntilOpen = false;
             if (watchListener != 0)

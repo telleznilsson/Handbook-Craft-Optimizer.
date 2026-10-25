@@ -44,5 +44,15 @@
   "hover-tooltip-variant-slide": "Muestra compatible {0}/{1} · cambia cada segundo",
   "hover-tooltip-unlocalized-item": "Objeto sin nombre traducido",
   "recipe-variants-info": "Salida alternativa {0}/{1} · clic para cargar esta receta",
-  "recipe-variants-info-short": "ALT {0}/{1}"
+  "recipe-variants-info-short": "ALT {0}/{1}",
+  "filter-recent": "Recientes",
+  "filter-no-recent-recipes": "Todavía no has seleccionado recetas",
+  "hover-tooltip-availability": "Tienes {0} · faltan {1}",
+  "hover-tooltip-batches-available": "Tandas completas posibles: {0}",
+  "hover-tooltip-batches-missing": "Faltan materiales o herramientas para una tanda",
+  "ingredient-search-button": "SRCH",
+  "ingredient-search-pick-prompt": "Haz clic en un objeto de tu mochila o barra rápida para buscar.",
+  "filter-uses-ingredient": "Usan: {0}",
+  "filter-no-recipes-use-ingredient": "No hay recetas de cuadrícula que usen {0}.",
+  "ingredient-search-hint": "Recetas que aceptan: {0}\nBusca por resultado · clic: cargar receta"
 }

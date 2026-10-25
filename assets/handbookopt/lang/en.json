@@ -44,5 +44,15 @@
   "hover-tooltip-variant-slide": "Compatible sample {0}/{1} · changes every second",
   "hover-tooltip-unlocalized-item": "Item name is not translated",
   "recipe-variants-info": "Output variant {0}/{1} · click to load this recipe",
-  "recipe-variants-info-short": "ALT {0}/{1}"
+  "recipe-variants-info-short": "ALT {0}/{1}",
+  "filter-recent": "Recent recipes",
+  "filter-no-recent-recipes": "No recently selected recipes yet",
+  "hover-tooltip-availability": "Have {0} · missing {1}",
+  "hover-tooltip-batches-available": "Complete batches available: {0}",
+  "hover-tooltip-batches-missing": "Missing materials or tools for a complete batch",
+  "ingredient-search-button": "SRCH",
+  "ingredient-search-pick-prompt": "Click an item in your backpack or hotbar to search.",
+  "filter-uses-ingredient": "Uses: {0}",
+  "filter-no-recipes-use-ingredient": "No grid recipes use {0}.",
+  "ingredient-search-hint": "Recipes that accept: {0}\nSearch by output name · click: load recipe"
 }

@@ -2485,4 +2485,40 @@ namespace HandbookOpt
             catch { /* A failed hint must never cancel the native inventory click. */ }
         }
     }
+
+
+    /// <summary>
+    /// Captures a player inventory stack only when the crafting selector has armed
+    /// the one-shot "recipes using this ingredient" action. All ordinary inventory
+    /// clicks continue through Vintage Story's native handler.
+    /// </summary>
+    [HarmonyPatch]
+    public static class IngredientRecipeSearchSlotClickPatch
+    {
+        static MethodBase TargetMethod()
+        {
+            return AccessTools.Method(typeof(GuiElementItemSlotGridBase), nameof(GuiElementItemSlotGridBase.OnMouseDownOnElement),
+                new[] { typeof(ICoreClientAPI), typeof(MouseEvent) });
+        }
+
+        static bool Prepare() => TargetMethod() != null;
+
+        [HarmonyPrefix]
+        [HarmonyPriority(Priority.First)]
+        public static bool Prefix(GuiElementItemSlotGridBase __instance, ICoreClientAPI api, MouseEvent args)
+        {
+            try
+            {
+                CraftPickerDialog picker = HandbookOptMod.Picker;
+                if (picker != null && picker.TryCaptureIngredientFromSlot(__instance, args))
+                    return false;
+            }
+            catch (Exception e)
+            {
+                try { HandbookOptMod.Capi?.Logger.Debug("[HandbookOpt] Ingredient search click capture skipped: {0}", e.Message); }
+                catch { }
+            }
+            return true;
+        }
+    }
 }
